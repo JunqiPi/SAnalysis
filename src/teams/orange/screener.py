@@ -1,0 +1,523 @@
+"""
+Orange Team: Gamma Squeeze & Options Flow Hunter
+
+Phase 1 data sources:
+  - yfinance options module (chains, OI, volume, IV, greeks)
+
+Scoring model (0-100):
+  - Options Activity    (0-25): Total volume, unusual volume/OI ratio
+  - Gamma Exposure      (0-25): Estimated GEX, concentration near spot
+  - IV Dynamics         (0-25): IV level, IV rank proxy, skew
+  - Open Interest Setup (0-25): OI concentration, put/call OI ratio, OI changes
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from src.core.base import BaseScreener
+from src.core.data_types import OptionsSnapshot, ScreenResult
+from src.utils import market_data
+
+logger = logging.getLogger(__name__)
+
+
+class GammaSqueezeScreener(BaseScreener):
+    """Orange Team screener: identifies gamma squeeze and unusual options flow."""
+
+    @property
+    def team_name(self) -> str:
+        return "orange"
+
+    def _team_cfg(self):
+        return self.cfg["orange_team"]
+
+    # ------------------------------------------------------------------
+    # Candidate discovery
+    # ------------------------------------------------------------------
+
+    def fetch_candidates(self) -> list[str]:
+        """Return tickers with active options markets.
+
+        Phase 1: uses a curated list of liquid optionable tickers.
+        Phase 2+: will scan option volume screeners.
+        """
+        # Curated list of meme/squeeze-adjacent optionable tickers
+        return [
+            "GME", "AMC", "TSLA", "NVDA", "AAPL", "PLTR", "SOFI",
+            "NIO", "RIVN", "LCID", "BBBY", "CLOV", "FUBO", "MARA",
+            "RIOT", "COIN", "HOOD", "SNAP", "PINS", "RBLX",
+            "DKNG", "SPCE", "WISH", "OPEN", "UPST",
+        ]
+
+    # ------------------------------------------------------------------
+    # Data collection
+    # ------------------------------------------------------------------
+
+    def _get_near_term_snapshot(self, ticker: str) -> Optional[OptionsSnapshot]:
+        """Fetch option chain for the nearest expiration within N days."""
+        expirations = market_data.get_options_expirations(ticker)
+        if not expirations:
+            return None
+
+        cfg = self._team_cfg()
+        max_days = cfg.get("near_expiry_days", 30)
+        now = datetime.now(timezone.utc).date()
+
+        target_exp = None
+        for exp_str in expirations:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            delta = (exp_date - now).days
+            if 0 < delta <= max_days:
+                target_exp = exp_str
+                break
+
+        if target_exp is None and expirations:
+            target_exp = expirations[0]  # Fallback to nearest available
+
+        if target_exp is None:
+            return None
+
+        calls, puts = market_data.get_options_chain(ticker, target_exp)
+        if calls.empty and puts.empty:
+            return None
+
+        call_vol = int(calls["volume"].sum()) if "volume" in calls.columns else 0
+        put_vol = int(puts["volume"].sum()) if "volume" in puts.columns else 0
+        call_oi = int(calls["openInterest"].sum()) if "openInterest" in calls.columns else 0
+        put_oi = int(puts["openInterest"].sum()) if "openInterest" in puts.columns else 0
+
+        pcr = (put_vol / call_vol) if call_vol > 0 else 0.0
+
+        return OptionsSnapshot(
+            ticker=ticker,
+            expiration=target_exp,
+            calls=calls,
+            puts=puts,
+            total_call_volume=call_vol,
+            total_put_volume=put_vol,
+            total_call_oi=call_oi,
+            total_put_oi=put_oi,
+            put_call_ratio=pcr,
+        )
+
+    # ------------------------------------------------------------------
+    # GEX estimation (simplified)
+    # ------------------------------------------------------------------
+
+    def _estimate_gex(self, snap: OptionsSnapshot, spot: float) -> dict:
+        """Estimate Gamma Exposure (GEX) from option chain data.
+
+        This is a simplified GEX calculation using available yfinance data.
+        Real GEX requires dealer positioning data (Phase 2+ via SpotGamma).
+
+        Approximation:
+            GEX_per_strike = Gamma * OI * 100 * spot_price
+            Net GEX = sum(call_GEX) - sum(put_GEX)
+
+        The sign convention assumes dealers are net short calls and net long puts.
+        """
+        result = {
+            "net_gex": 0.0,
+            "max_gamma_strike": None,
+            "gex_flip_strike": None,
+            "call_gex_total": 0.0,
+            "put_gex_total": 0.0,
+        }
+
+        calls = snap.calls
+        puts = snap.puts
+
+        has_gamma = "gamma" in calls.columns if not calls.empty else False
+
+        if not has_gamma:
+            # Without greeks, use OI concentration as a proxy
+            return self._oi_concentration_proxy(snap, spot)
+
+        # Calculate per-strike GEX
+        call_gex = 0.0
+        put_gex = 0.0
+        max_gamma = 0.0
+        max_gamma_strike = spot
+
+        for _, row in calls.iterrows():
+            gamma = row.get("gamma", 0) or 0
+            oi = row.get("openInterest", 0) or 0
+            strike = row.get("strike", 0)
+            gex = gamma * oi * 100 * spot
+            call_gex += gex
+            if gex > max_gamma:
+                max_gamma = gex
+                max_gamma_strike = strike
+
+        for _, row in puts.iterrows():
+            gamma = row.get("gamma", 0) or 0
+            oi = row.get("openInterest", 0) or 0
+            gex = gamma * oi * 100 * spot
+            put_gex += gex
+
+        net_gex = call_gex - put_gex
+
+        # GEX flip: approximate strike where cumulative GEX changes sign
+        flip_strike = self._find_gex_flip(calls, puts, spot)
+
+        result["net_gex"] = net_gex
+        result["call_gex_total"] = call_gex
+        result["put_gex_total"] = put_gex
+        result["max_gamma_strike"] = max_gamma_strike
+        result["gex_flip_strike"] = flip_strike
+
+        return result
+
+    def _find_gex_flip(
+        self, calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
+    ) -> Optional[float]:
+        """Find the strike price where net GEX flips from positive to negative."""
+        if calls.empty or "gamma" not in calls.columns:
+            return None
+
+        all_strikes = sorted(set(
+            calls["strike"].tolist() + puts["strike"].tolist()
+        ))
+
+        call_map = {}
+        if not calls.empty and "gamma" in calls.columns:
+            for _, r in calls.iterrows():
+                call_map[r["strike"]] = (r.get("gamma", 0) or 0) * (r.get("openInterest", 0) or 0)
+
+        put_map = {}
+        if not puts.empty and "gamma" in puts.columns:
+            for _, r in puts.iterrows():
+                put_map[r["strike"]] = (r.get("gamma", 0) or 0) * (r.get("openInterest", 0) or 0)
+
+        prev_net = None
+        for strike in all_strikes:
+            c_gex = call_map.get(strike, 0)
+            p_gex = put_map.get(strike, 0)
+            net = c_gex - p_gex
+            if prev_net is not None and prev_net * net < 0:
+                return float(strike)
+            prev_net = net
+
+        return None
+
+    def _oi_concentration_proxy(self, snap: OptionsSnapshot, spot: float) -> dict:
+        """When greeks are unavailable, use OI concentration as GEX proxy."""
+        result = {
+            "net_gex": 0.0,
+            "max_gamma_strike": None,
+            "gex_flip_strike": None,
+            "call_gex_total": 0.0,
+            "put_gex_total": 0.0,
+        }
+
+        calls = snap.calls
+        if not calls.empty and "openInterest" in calls.columns and "strike" in calls.columns:
+            max_oi_idx = calls["openInterest"].idxmax()
+            if pd.notna(max_oi_idx):
+                result["max_gamma_strike"] = float(calls.loc[max_oi_idx, "strike"])
+                result["call_gex_total"] = float(calls["openInterest"].sum())
+
+        puts = snap.puts
+        if not puts.empty and "openInterest" in puts.columns:
+            result["put_gex_total"] = float(puts["openInterest"].sum())
+
+        result["net_gex"] = result["call_gex_total"] - result["put_gex_total"]
+        return result
+
+    # ------------------------------------------------------------------
+    # Unusual options activity detection
+    # ------------------------------------------------------------------
+
+    def _detect_unusual_activity(self, snap: OptionsSnapshot) -> dict:
+        """Detect unusual options activity patterns.
+
+        Key signals:
+          - Volume >> OI (new positions being opened aggressively)
+          - Concentrated OTM call buying (squeeze anticipation)
+          - Put volume collapse (bears retreating)
+        """
+        cfg = self._team_cfg()
+        unusual_ratio = cfg.get("unusual_volume_ratio", 3.0)
+        result = {
+            "has_unusual_calls": False,
+            "has_unusual_puts": False,
+            "max_vol_oi_ratio": 0.0,
+            "otm_call_concentration": 0.0,
+            "unusual_strikes": [],
+        }
+
+        calls = snap.calls
+        if calls.empty or "volume" not in calls.columns or "openInterest" not in calls.columns:
+            return result
+
+        # Find strikes where volume >> OI
+        calls_valid = calls[(calls["openInterest"] > 0) & (calls["volume"] > 0)].copy()
+        if not calls_valid.empty:
+            calls_valid["vol_oi_ratio"] = calls_valid["volume"] / calls_valid["openInterest"]
+            unusual = calls_valid[calls_valid["vol_oi_ratio"] >= unusual_ratio]
+            if not unusual.empty:
+                result["has_unusual_calls"] = True
+                result["max_vol_oi_ratio"] = float(unusual["vol_oi_ratio"].max())
+                result["unusual_strikes"] = unusual["strike"].tolist()
+
+        # OTM call concentration (calls with strike > current max strike midpoint)
+        if "strike" in calls.columns and len(calls) > 0:
+            mid_strike = calls["strike"].median()
+            otm_calls = calls[calls["strike"] > mid_strike]
+            total_vol = calls["volume"].sum()
+            if total_vol > 0:
+                otm_vol = otm_calls["volume"].sum()
+                result["otm_call_concentration"] = float(otm_vol / total_vol)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # IV analysis
+    # ------------------------------------------------------------------
+
+    def _analyze_iv(self, snap: OptionsSnapshot, spot: float) -> dict:
+        """Analyze implied volatility dynamics."""
+        result = {
+            "avg_call_iv": None,
+            "avg_put_iv": None,
+            "atm_iv": None,
+            "iv_skew": None,   # Put IV - Call IV at similar strikes
+        }
+
+        calls = snap.calls
+        puts = snap.puts
+
+        iv_col = "impliedVolatility"
+
+        if not calls.empty and iv_col in calls.columns:
+            valid_iv = calls[calls[iv_col] > 0][iv_col]
+            if not valid_iv.empty:
+                result["avg_call_iv"] = float(valid_iv.mean())
+
+        if not puts.empty and iv_col in puts.columns:
+            valid_iv = puts[puts[iv_col] > 0][iv_col]
+            if not valid_iv.empty:
+                result["avg_put_iv"] = float(valid_iv.mean())
+
+        # ATM IV: closest strike to spot
+        if not calls.empty and "strike" in calls.columns and iv_col in calls.columns:
+            atm_idx = (calls["strike"] - spot).abs().idxmin()
+            if pd.notna(atm_idx):
+                atm_iv = calls.loc[atm_idx, iv_col]
+                if atm_iv and atm_iv > 0:
+                    result["atm_iv"] = float(atm_iv)
+
+        # IV skew
+        if result["avg_put_iv"] is not None and result["avg_call_iv"] is not None:
+            result["iv_skew"] = result["avg_put_iv"] - result["avg_call_iv"]
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def _score_options_activity(self, snap: OptionsSnapshot, unusual: dict) -> float:
+        """Score 0-25: How active and unusual is the options flow?"""
+        score = 0.0
+        cfg = self._team_cfg()
+        min_vol = cfg.get("min_option_volume", 1000)
+
+        total_vol = snap.total_call_volume + snap.total_put_volume
+        if total_vol < min_vol:
+            return 0.0
+
+        # Volume level
+        if total_vol >= 50000:
+            score += 8.0
+        elif total_vol >= 20000:
+            score += 6.0
+        elif total_vol >= 5000:
+            score += 4.0
+        else:
+            score += 2.0
+
+        # Unusual activity
+        if unusual["has_unusual_calls"]:
+            ratio = unusual["max_vol_oi_ratio"]
+            if ratio >= 10:
+                score += 10.0
+            elif ratio >= 5:
+                score += 7.0
+            elif ratio >= 3:
+                score += 4.0
+
+        # OTM call concentration (squeeze-anticipation signal)
+        otm_conc = unusual["otm_call_concentration"]
+        if otm_conc > 0.7:
+            score += 7.0
+        elif otm_conc > 0.5:
+            score += 4.0
+        elif otm_conc > 0.3:
+            score += 2.0
+
+        return min(25.0, score)
+
+    def _score_gex(self, gex: dict, spot: float) -> float:
+        """Score 0-25: Gamma exposure setup (negative GEX = squeeze-prone)."""
+        score = 0.0
+        net = gex.get("net_gex", 0)
+
+        # Negative net GEX means dealers are short gamma -> amplifies moves
+        if net < 0:
+            score += 12.0
+        elif net == 0:
+            score += 5.0
+        else:
+            # Positive GEX: dealers dampen moves (less squeeze-friendly)
+            score += 2.0
+
+        # Max gamma strike proximity to spot (pin risk / magnet effect)
+        mg_strike = gex.get("max_gamma_strike")
+        if mg_strike and spot > 0:
+            proximity = abs(mg_strike - spot) / spot
+            if proximity < 0.02:
+                score += 8.0  # Very close: strong pin or breakout potential
+            elif proximity < 0.05:
+                score += 5.0
+            elif proximity < 0.10:
+                score += 3.0
+
+        # GEX flip presence (indicates regime boundary)
+        if gex.get("gex_flip_strike") is not None:
+            score += 5.0
+
+        return min(25.0, score)
+
+    def _score_iv(self, iv_data: dict) -> float:
+        """Score 0-25: IV dynamics and skew analysis."""
+        score = 0.0
+
+        atm_iv = iv_data.get("atm_iv")
+        if atm_iv is not None:
+            # High IV = expectation of big move
+            if atm_iv >= 1.5:
+                score += 10.0
+            elif atm_iv >= 1.0:
+                score += 8.0
+            elif atm_iv >= 0.6:
+                score += 5.0
+            elif atm_iv >= 0.3:
+                score += 2.0
+
+        # IV skew: positive = puts more expensive = hedging demand
+        skew = iv_data.get("iv_skew")
+        if skew is not None:
+            if skew > 0.2:
+                score += 8.0  # Heavy put hedging (potential short squeeze fuel)
+            elif skew > 0.1:
+                score += 5.0
+            elif skew > 0:
+                score += 2.0
+            elif skew < -0.1:
+                score += 7.0  # Call IV premium = aggressive call buying
+
+        return min(25.0, score)
+
+    def _score_oi_setup(self, snap: OptionsSnapshot) -> float:
+        """Score 0-25: Open interest setup quality."""
+        score = 0.0
+
+        total_oi = snap.total_call_oi + snap.total_put_oi
+        if total_oi == 0:
+            return 0.0
+
+        # High absolute OI = many positions to unwind
+        if total_oi >= 500000:
+            score += 8.0
+        elif total_oi >= 100000:
+            score += 6.0
+        elif total_oi >= 50000:
+            score += 4.0
+        else:
+            score += 2.0
+
+        # Call OI dominance (bullish positioning)
+        if snap.total_call_oi > 0:
+            call_oi_ratio = snap.total_call_oi / total_oi
+            if call_oi_ratio > 0.65:
+                score += 7.0  # Heavy call OI = dealer short gamma
+            elif call_oi_ratio > 0.55:
+                score += 4.0
+
+        # Put/call OI imbalance (extreme = potential catalyst)
+        pc_oi = snap.total_put_oi / max(snap.total_call_oi, 1)
+        if pc_oi > 2.0:
+            score += 5.0  # Extreme put hedging
+        elif pc_oi < 0.3:
+            score += 5.0  # Extreme call dominance
+
+        # Volume relative to OI (new positioning intensity)
+        total_vol = snap.total_call_volume + snap.total_put_volume
+        if total_oi > 0:
+            vol_oi = total_vol / total_oi
+            if vol_oi > 0.5:
+                score += 5.0
+            elif vol_oi > 0.3:
+                score += 3.0
+
+        return min(25.0, score)
+
+    # ------------------------------------------------------------------
+    # Main analysis
+    # ------------------------------------------------------------------
+
+    def analyze(self, ticker: str) -> ScreenResult | None:
+        """Full analysis pipeline for a single ticker."""
+        snap = self._get_near_term_snapshot(ticker)
+        if snap is None:
+            logger.debug("[orange] No options data for %s, skipping.", ticker)
+            return None
+
+        spot = market_data.get_current_price(ticker)
+        if spot is None or spot <= 0:
+            return None
+
+        gex = self._estimate_gex(snap, spot)
+        unusual = self._detect_unusual_activity(snap)
+        iv_data = self._analyze_iv(snap, spot)
+
+        s1 = self._score_options_activity(snap, unusual)
+        s2 = self._score_gex(gex, spot)
+        s3 = self._score_iv(iv_data)
+        s4 = self._score_oi_setup(snap)
+        total = s1 + s2 + s3 + s4
+
+        return ScreenResult(
+            ticker=ticker,
+            team="orange",
+            score=total,
+            signals={
+                "options_activity": s1,
+                "gamma_exposure": s2,
+                "iv_dynamics": s3,
+                "oi_setup": s4,
+                "net_gex": gex.get("net_gex", 0),
+                "atm_iv": iv_data.get("atm_iv", 0),
+                "put_call_ratio": snap.put_call_ratio,
+                "total_volume": snap.total_call_volume + snap.total_put_volume,
+                "max_vol_oi_ratio": unusual.get("max_vol_oi_ratio", 0),
+            },
+            metadata={
+                "expiration": snap.expiration,
+                "spot_price": spot,
+                "max_gamma_strike": gex.get("max_gamma_strike"),
+                "gex_flip_strike": gex.get("gex_flip_strike"),
+                "unusual_strikes": unusual.get("unusual_strikes", []),
+                "iv_skew": iv_data.get("iv_skew"),
+            },
+        )

@@ -1,0 +1,58 @@
+[project]
+name = "sanalysis"
+version = "0.2.0"
+description = "Meme Stock Analysis Platform - Five-Team Data Infrastructure"
+requires-python = ">=3.10"
+dependencies = [
+    # Data acquisition
+    "yfinance>=0.2.36",
+    "requests>=2.31.0",
+    # NLP / Sentiment
+    "vaderSentiment>=3.3.2",
+    # Quantitative analysis
+    "pandas>=2.1.0",
+    "numpy>=1.24.0",
+    "pandas_ta>=0.3.14b1",
+    # Data storage
+    "pyarrow>=14.0.0",
+    # Visualization (optional for Phase 1)
+    "plotly>=5.18.0",
+    "matplotlib>=3.8.0",
+    # Utilities
+    "pyyaml>=6.0.1",
+    "pytrends>=4.9.2",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.1.0",
+]
+
+[project.optional-dependencies]
+reddit = [
+    "praw>=7.7.1",
+]
+dev = [
+    "ipython>=8.0",
+    "jupyter>=1.0",
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+dashboard = [
+    "streamlit>=1.30.0",
+]
+all = [
+    "sanalysis[reddit,dev,dashboard]",
+]
+
+[project.scripts]
+sanalysis = "main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,561 @@
+"""
+Yellow Team: Social Sentiment Quantitative Recon
+
+Phase 1 data sources:
+  - praw (Reddit API): r/wallstreetbets, r/stocks, r/shortsqueeze, etc.
+  - ApeWisdom API: Reddit/4chan ticker mention frequency
+  - Google Trends (pytrends): search volume spikes
+  - VADER sentiment: rule-based sentiment scoring
+
+Scoring model (0-100):
+  - Mention Frequency  (0-25): Raw mention count, trending rank, spike detection
+  - Sentiment Polarity (0-25): Bullish/bearish ratio, avg sentiment, consensus
+  - Momentum / Trend   (0-25): Google Trends score, mention acceleration
+  - Quality Signals    (0-25): Source diversity, account quality, anti-bot score
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import pandas as pd
+import requests
+
+from src.core.base import BaseScreener
+from src.core.cache import cache_json, load_cached_json
+from src.core.data_types import ScreenResult, SentimentSnapshot
+
+logger = logging.getLogger(__name__)
+
+# VADER sentiment
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _VADER = SentimentIntensityAnalyzer()
+    _HAS_VADER = True
+except ImportError:
+    _VADER = None
+    _HAS_VADER = False
+    logger.warning("vaderSentiment not installed; sentiment scoring disabled.")
+
+# Reddit (praw)
+try:
+    import praw
+    _HAS_PRAW = True
+except ImportError:
+    _HAS_PRAW = False
+    logger.warning("praw not installed; Reddit scanning disabled.")
+
+# Google Trends (pytrends)
+try:
+    from pytrends.request import TrendReq
+    _HAS_PYTRENDS = True
+except ImportError:
+    _HAS_PYTRENDS = False
+    logger.warning("pytrends not installed; Google Trends scanning disabled.")
+
+# Common ticker pattern for extracting $TICKER or uppercase 2-5 letter words
+_TICKER_RE = re.compile(r'\$([A-Z]{1,5})\b|(?<!\w)([A-Z]{2,5})(?!\w)')
+
+# Words that look like tickers but aren't
+_TICKER_BLACKLIST = frozenset({
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL",
+    "CAN", "HER", "WAS", "ONE", "OUR", "OUT", "HAS", "HIS",
+    "HOW", "MAN", "NEW", "NOW", "OLD", "SEE", "WAY", "WHO",
+    "DID", "GOT", "LET", "SAY", "SHE", "TOO", "USE", "CEO",
+    "CFO", "COO", "IPO", "SEC", "FDA", "ETF", "ATH", "ATL",
+    "DD", "OG", "OP", "PM", "AM", "US", "UK", "EU", "IT",
+    "GDP", "EPS", "PE", "PB", "PS", "IV", "OI", "OTM", "ITM",
+    "ATM", "DTE", "IMO", "YOLO", "HODL", "FOMO", "TLDR", "TL",
+    "EDIT", "LINK", "POST", "JUST", "LIKE", "VERY", "MUCH",
+    "SOME", "THIS", "THAT", "WHAT", "WITH", "FROM", "THEY",
+    "WILL", "BEEN", "HAVE", "EACH", "MAKE", "WHEN", "THAN",
+    "THEM", "MOST", "ONLY", "OVER", "SUCH", "TAKE", "LONG",
+    "ALSO", "INTO", "YEAR", "YOUR", "JUST", "MORE", "NEXT",
+    "GOOD", "HIGH", "HUGE", "BIG", "LOW", "UP", "DOWN",
+    "PUMP", "DUMP", "BEAR", "BULL", "HOLD", "SELL", "BUY",
+    "CALL", "PUT", "MOON", "GAIN", "LOSS", "RED", "GREEN",
+})
+
+
+def _extract_tickers(text: str) -> list[str]:
+    """Extract stock ticker symbols from text."""
+    matches = _TICKER_RE.findall(text)
+    tickers = set()
+    for dollar_match, bare_match in matches:
+        t = dollar_match or bare_match
+        if t and t not in _TICKER_BLACKLIST:
+            tickers.add(t)
+    return list(tickers)
+
+
+def _vader_score(text: str) -> float:
+    """Return VADER compound sentiment score (-1 to 1)."""
+    if not _HAS_VADER or _VADER is None:
+        return 0.0
+    scores = _VADER.polarity_scores(text)
+    return scores["compound"]
+
+
+class SocialSentimentScreener(BaseScreener):
+    """Yellow Team screener: quantifies social media sentiment and momentum."""
+
+    _reddit_warning_logged = False  # class-level flag to avoid log spam
+
+    @property
+    def team_name(self) -> str:
+        return "yellow"
+
+    def _team_cfg(self):
+        return self.cfg["yellow_team"]
+
+    def _check_reddit_credentials(self) -> bool:
+        """Check if Reddit API credentials are configured.
+
+        Logs a WARNING (once) if credentials are missing, since this
+        disables the sentiment_polarity scoring dimension entirely.
+        """
+        api_keys = self.cfg.get_nested("api_keys") or {}
+        client_id = api_keys.get("reddit_client_id", "")
+        client_secret = api_keys.get("reddit_client_secret", "")
+        has_creds = bool(client_id and client_secret)
+
+        if not has_creds and not SocialSentimentScreener._reddit_warning_logged:
+            logger.warning(
+                "[yellow] Reddit API credentials not configured! "
+                "sentiment_polarity will be 0 for ALL tickers. "
+                "To fix: create config/secrets.yaml with reddit_client_id "
+                "and reddit_client_secret, or set REDDIT_CLIENT_ID and "
+                "REDDIT_CLIENT_SECRET environment variables."
+            )
+            SocialSentimentScreener._reddit_warning_logged = True
+
+        return has_creds
+
+    # ------------------------------------------------------------------
+    # Candidate discovery (via ApeWisdom trending)
+    # ------------------------------------------------------------------
+
+    def fetch_candidates(self) -> list[str]:
+        """Fetch trending tickers from ApeWisdom + Reddit scan."""
+        # Early credential check so the warning appears at scan start
+        self._check_reddit_credentials()
+
+        tickers: list[str] = []
+
+        # Source 1: ApeWisdom API
+        aw_tickers = self._fetch_apewisdom()
+        tickers.extend(aw_tickers)
+
+        # Source 2: Reddit scan (if praw is configured)
+        reddit_tickers = self._scan_reddit_for_tickers()
+        tickers.extend(reddit_tickers)
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique: list[str] = []
+        for t in tickers:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+
+        if not unique:
+            # Fallback curated list
+            unique = ["GME", "AMC", "PLTR", "TSLA", "NVDA", "SOFI", "BB", "CLOV"]
+
+        return unique
+
+    def _fetch_apewisdom(self) -> list[str]:
+        """Fetch top trending tickers from ApeWisdom API."""
+        cached = load_cached_json("apewisdom", "trending")
+        if cached is not None:
+            return cached
+
+        url = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1"
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            top_n = self._team_cfg().get("apewisdom_top_n", 50)
+            tickers = [r["ticker"] for r in results[:top_n] if "ticker" in r]
+            cache_json("apewisdom", "trending", tickers)
+            logger.info("[yellow] ApeWisdom returned %d trending tickers.", len(tickers))
+            return tickers
+        except Exception:
+            logger.exception("[yellow] ApeWisdom API failed.")
+            return []
+
+    def _scan_reddit_for_tickers(self) -> list[str]:
+        """Scan configured subreddits for ticker mentions."""
+        cfg = self._team_cfg()
+        if not _HAS_PRAW:
+            return []
+
+        api_keys = self.cfg.get_nested("api_keys") or {}
+        client_id = api_keys.get("reddit_client_id", "")
+        client_secret = api_keys.get("reddit_client_secret", "")
+        user_agent = api_keys.get("reddit_user_agent", "SAnalysis/0.1")
+
+        if not client_id or not client_secret:
+            logger.info("[yellow] Reddit credentials not configured, skipping Reddit scan.")
+            return []
+
+        try:
+            reddit = praw.Reddit(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=user_agent,
+            )
+        except Exception:
+            logger.exception("[yellow] Failed to initialize Reddit client.")
+            return []
+
+        subreddits = cfg.get("subreddits", ["wallstreetbets"])
+        post_limit = cfg.get("reddit_post_limit", 100)
+        ticker_counts: dict[str, int] = {}
+
+        for sub_name in subreddits:
+            try:
+                sub = reddit.subreddit(sub_name)
+                for post in sub.hot(limit=post_limit):
+                    text = f"{post.title} {post.selftext}"
+                    for t in _extract_tickers(text):
+                        ticker_counts[t] = ticker_counts.get(t, 0) + 1
+            except Exception:
+                logger.exception("[yellow] Failed to scan r/%s", sub_name)
+
+        # Sort by mention count, return top tickers
+        sorted_tickers = sorted(ticker_counts, key=ticker_counts.get, reverse=True)
+        return sorted_tickers[:50]
+
+    # ------------------------------------------------------------------
+    # Per-ticker sentiment analysis
+    # ------------------------------------------------------------------
+
+    def _collect_sentiment(self, ticker: str) -> SentimentSnapshot:
+        """Aggregate sentiment data for a single ticker from all sources."""
+        snap = SentimentSnapshot(ticker=ticker)
+
+        # ApeWisdom mention data
+        aw_data = self._get_apewisdom_ticker(ticker)
+        if aw_data:
+            snap.mention_count += aw_data.get("mentions", 0)
+            snap.trending_rank = aw_data.get("rank")
+            snap.sources.append("apewisdom")
+
+        # Reddit sentiment (if available)
+        reddit_sentiment = self._get_reddit_sentiment(ticker)
+        if reddit_sentiment:
+            snap.mention_count += reddit_sentiment["count"]
+            snap.avg_sentiment = reddit_sentiment["avg_sentiment"]
+            snap.bullish_pct = reddit_sentiment["bullish_pct"]
+            snap.bearish_pct = reddit_sentiment["bearish_pct"]
+            snap.neutral_pct = reddit_sentiment["neutral_pct"]
+            snap.sources.append("reddit")
+
+        # Google Trends
+        gt_score = self._get_google_trends(ticker)
+        if gt_score is not None:
+            snap.google_trends_score = gt_score
+            snap.sources.append("google_trends")
+
+        return snap
+
+    def _get_apewisdom_ticker(self, ticker: str) -> Optional[dict]:
+        """Get ApeWisdom data for a specific ticker."""
+        cached = load_cached_json("apewisdom", f"ticker_{ticker}")
+        if cached is not None:
+            return cached
+
+        # First try from the trending list
+        url = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1"
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            for i, result in enumerate(data.get("results", []), 1):
+                if result.get("ticker") == ticker:
+                    out = {
+                        "mentions": result.get("mentions", 0),
+                        "rank": i,
+                        "upvotes": result.get("upvotes", 0),
+                        "mentions_24h_ago": result.get("mentions_24h_ago", 0),
+                    }
+                    cache_json("apewisdom", f"ticker_{ticker}", out)
+                    return out
+        except Exception:
+            pass
+        return None
+
+    def _get_reddit_sentiment(self, ticker: str) -> Optional[dict]:
+        """Compute sentiment from Reddit posts mentioning this ticker.
+
+        Uses cached scan results if available, otherwise falls back
+        to a targeted search.
+        """
+        cached = load_cached_json("reddit_sentiment", ticker)
+        if cached is not None:
+            return cached
+
+        if not _HAS_PRAW or not _HAS_VADER:
+            return None
+
+        if not self._check_reddit_credentials():
+            return None
+
+        api_keys = self.cfg.get_nested("api_keys") or {}
+        client_id = api_keys.get("reddit_client_id", "")
+        client_secret = api_keys.get("reddit_client_secret", "")
+
+        try:
+            reddit = praw.Reddit(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=api_keys.get("reddit_user_agent", "SAnalysis/0.1"),
+            )
+        except Exception:
+            return None
+
+        cfg = self._team_cfg()
+        min_score = cfg.get("reddit_min_score", 10)
+        sentiments: list[float] = []
+        count = 0
+
+        for sub_name in ["wallstreetbets", "stocks", "shortsqueeze"]:
+            try:
+                sub = reddit.subreddit(sub_name)
+                for post in sub.search(ticker, sort="hot", time_filter="week", limit=30):
+                    if post.score < min_score:
+                        continue
+                    text = f"{post.title} {post.selftext}"
+                    if ticker in _extract_tickers(text):
+                        sentiments.append(_vader_score(text))
+                        count += 1
+            except Exception:
+                continue
+
+        if not sentiments:
+            return None
+
+        avg = sum(sentiments) / len(sentiments)
+        bullish_threshold = cfg.get("sentiment_bullish_threshold", 0.3)
+        bearish_threshold = cfg.get("sentiment_bearish_threshold", -0.3)
+
+        bullish = sum(1 for s in sentiments if s >= bullish_threshold) / len(sentiments)
+        bearish = sum(1 for s in sentiments if s <= bearish_threshold) / len(sentiments)
+        neutral = 1.0 - bullish - bearish
+
+        result = {
+            "count": count,
+            "avg_sentiment": avg,
+            "bullish_pct": bullish,
+            "bearish_pct": bearish,
+            "neutral_pct": neutral,
+        }
+        cache_json("reddit_sentiment", ticker, result)
+        return result
+
+    def _get_google_trends(self, ticker: str) -> Optional[float]:
+        """Get Google Trends interest score for the ticker."""
+        if not _HAS_PYTRENDS:
+            return None
+
+        cached = load_cached_json("gtrends", ticker)
+        if cached is not None:
+            return cached
+
+        cfg = self._team_cfg()
+        try:
+            pytrends = TrendReq(hl="en-US", tz=360)
+            # Search for "$TICKER stock" to reduce noise
+            kw = f"{ticker} stock"
+            pytrends.build_payload(
+                [kw],
+                timeframe=cfg.get("google_trends_timeframe", "now 7-d"),
+                geo=cfg.get("google_trends_geo", "US"),
+            )
+            df = pytrends.interest_over_time()
+            if df.empty:
+                return None
+
+            # Return the most recent interest value (0-100 scale)
+            score = float(df[kw].iloc[-1])
+            cache_json("gtrends", ticker, score)
+            return score
+        except Exception:
+            logger.debug("[yellow] Google Trends failed for %s", ticker)
+            return None
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def _score_mention_frequency(self, snap: SentimentSnapshot) -> float:
+        """Score 0-25: How much is this ticker being discussed?"""
+        score = 0.0
+
+        # Raw mention count
+        mc = snap.mention_count
+        if mc >= 500:
+            score += 10.0
+        elif mc >= 200:
+            score += 8.0
+        elif mc >= 100:
+            score += 6.0
+        elif mc >= 50:
+            score += 4.0
+        elif mc >= 10:
+            score += 2.0
+
+        # Trending rank on ApeWisdom
+        rank = snap.trending_rank
+        if rank is not None:
+            if rank <= 5:
+                score += 10.0
+            elif rank <= 10:
+                score += 7.0
+            elif rank <= 20:
+                score += 4.0
+            elif rank <= 50:
+                score += 2.0
+
+        # Google Trends score
+        gt = snap.google_trends_score
+        if gt is not None:
+            if gt >= 80:
+                score += 5.0
+            elif gt >= 50:
+                score += 3.0
+            elif gt >= 25:
+                score += 1.0
+
+        return min(25.0, score)
+
+    def _score_sentiment_polarity(self, snap: SentimentSnapshot) -> float:
+        """Score 0-25: Sentiment direction and strength."""
+        score = 0.0
+
+        # Average sentiment
+        avg = snap.avg_sentiment
+        if avg >= 0.5:
+            score += 10.0
+        elif avg >= 0.3:
+            score += 8.0
+        elif avg >= 0.1:
+            score += 5.0
+        elif avg <= -0.3:
+            score += 2.0  # Extremely bearish = potential contrarian signal
+        elif avg <= -0.1:
+            score += 1.0
+
+        # Bullish consensus
+        if snap.bullish_pct >= 0.7:
+            score += 10.0
+        elif snap.bullish_pct >= 0.5:
+            score += 7.0
+        elif snap.bullish_pct >= 0.3:
+            score += 4.0
+
+        # Bearish minority (some bearish = healthy, extreme = risk)
+        if 0.1 <= snap.bearish_pct <= 0.3:
+            score += 5.0  # Healthy debate: not pure echo chamber
+
+        return min(25.0, score)
+
+    def _score_momentum(self, snap: SentimentSnapshot) -> float:
+        """Score 0-25: Is sentiment accelerating?"""
+        score = 0.0
+
+        # Google Trends as momentum proxy
+        gt = snap.google_trends_score
+        if gt is not None:
+            if gt >= 90:
+                score += 12.0  # Parabolic interest
+            elif gt >= 70:
+                score += 8.0
+            elif gt >= 50:
+                score += 5.0
+
+        # ApeWisdom rank as momentum (lower rank = hotter)
+        rank = snap.trending_rank
+        if rank is not None:
+            if rank <= 3:
+                score += 13.0
+            elif rank <= 10:
+                score += 8.0
+            elif rank <= 25:
+                score += 4.0
+
+        return min(25.0, score)
+
+    def _score_quality(self, snap: SentimentSnapshot) -> float:
+        """Score 0-25: Data quality and signal reliability."""
+        score = 0.0
+
+        # Source diversity: more sources = higher confidence
+        n_sources = len(snap.sources)
+        if n_sources >= 3:
+            score += 10.0
+        elif n_sources >= 2:
+            score += 6.0
+        elif n_sources >= 1:
+            score += 3.0
+
+        # Sample size (mention count as proxy)
+        if snap.mention_count >= 100:
+            score += 8.0
+        elif snap.mention_count >= 50:
+            score += 5.0
+        elif snap.mention_count >= 20:
+            score += 3.0
+
+        # Sentiment is not overly extreme (pure echo chamber = unreliable)
+        if 0.2 <= snap.bullish_pct <= 0.8:
+            score += 7.0  # Balanced discussion
+        elif snap.bullish_pct > 0.8:
+            score += 3.0  # Echo chamber penalty
+
+        return min(25.0, score)
+
+    # ------------------------------------------------------------------
+    # Main analysis
+    # ------------------------------------------------------------------
+
+    def analyze(self, ticker: str) -> ScreenResult | None:
+        """Full sentiment analysis for a single ticker."""
+        snap = self._collect_sentiment(ticker)
+
+        # Must have at least some data
+        if snap.mention_count == 0 and snap.google_trends_score is None:
+            return None
+
+        s1 = self._score_mention_frequency(snap)
+        s2 = self._score_sentiment_polarity(snap)
+        s3 = self._score_momentum(snap)
+        s4 = self._score_quality(snap)
+        total = s1 + s2 + s3 + s4
+
+        return ScreenResult(
+            ticker=ticker,
+            team="yellow",
+            score=total,
+            signals={
+                "mention_frequency": s1,
+                "sentiment_polarity": s2,
+                "sentiment_momentum": s3,
+                "signal_quality": s4,
+                "mention_count": float(snap.mention_count),
+                "avg_sentiment": snap.avg_sentiment,
+                "bullish_pct": snap.bullish_pct,
+                "bearish_pct": snap.bearish_pct,
+                "google_trends": snap.google_trends_score or 0,
+            },
+            metadata={
+                "trending_rank": snap.trending_rank,
+                "sources": snap.sources,
+            },
+        )

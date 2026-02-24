@@ -1,0 +1,145 @@
+# ============================================================
+# SAnalysis - Default Configuration
+# Phase 1: Zero-Cost Prototype ($0/month)
+# ============================================================
+
+general:
+  cache_dir: "data/cache"
+  output_dir: "data/output"
+  cache_ttl_hours: 4          # How long cached data stays valid
+  max_workers: 4              # Concurrent data fetch threads
+  log_level: "INFO"
+
+# -----------------------------------------------------------
+# API Credentials (override via config/secrets.yaml or env vars)
+# -----------------------------------------------------------
+api_keys:
+  reddit_client_id: ""
+  reddit_client_secret: ""
+  reddit_user_agent: "SAnalysis/0.1 by MemeStockTeam"
+  # Future Phase 2+ keys:
+  # finnhub_api_key: ""
+  # alpha_vantage_key: ""
+
+# -----------------------------------------------------------
+# Red Team: Short Squeeze Sniper
+# -----------------------------------------------------------
+red_team:
+  # Screening thresholds
+  min_short_float_pct: 10.0     # Minimum short float % to consider
+  min_days_to_cover: 3.0        # Minimum DTC
+  min_borrow_fee_pct: 5.0       # Elevated borrow fee threshold
+  max_market_cap_millions: 10000 # Focus on small/mid caps
+  min_relative_volume: 1.5      # Minimum RVOL for activity signal
+
+  # Scoring weights (sum = 100)
+  weight_short_intensity: 25
+  weight_cover_difficulty: 25
+  weight_catalyst_proximity: 25
+  weight_technical_momentum: 25
+
+  # Finviz screener filters
+  finviz_filters:
+    short_float: "over10"         # >10% short float
+    average_volume: "over200k"    # Liquid enough to trade
+    price: "over1"                # No penny stocks
+
+# -----------------------------------------------------------
+# Orange Team: Gamma Squeeze & Options Flow Hunter
+# -----------------------------------------------------------
+orange_team:
+  # Options screening thresholds
+  min_option_volume: 1000         # Minimum total option volume
+  unusual_volume_ratio: 3.0       # Vol/OI ratio threshold for unusual activity
+  min_iv_percentile: 50           # Minimum IV rank to flag
+  gex_calculation_enabled: true
+  near_expiry_days: 30            # Focus on near-term expirations
+
+  # GEX parameters
+  spot_price_range_pct: 20        # +/- range around spot for GEX calc
+  strike_step_count: 50           # Number of strikes to evaluate
+
+# -----------------------------------------------------------
+# Yellow Team: Social Sentiment Quant Recon
+# -----------------------------------------------------------
+yellow_team:
+  # Reddit configuration
+  subreddits:
+    - "wallstreetbets"
+    - "stocks"
+    - "pennystocks"
+    - "shortsqueeze"
+    - "options"
+    - "smallstreetbets"
+  reddit_post_limit: 100          # Posts per subreddit per scan
+  reddit_min_score: 10            # Minimum upvotes to consider
+  reddit_min_account_age_days: 30 # Bot filter
+  reddit_min_karma: 100           # Bot filter
+
+  # ApeWisdom
+  apewisdom_top_n: 50             # Top N trending tickers
+
+  # Google Trends
+  google_trends_timeframe: "now 7-d"
+  google_trends_geo: "US"
+
+  # Sentiment thresholds
+  sentiment_bullish_threshold: 0.3
+  sentiment_bearish_threshold: -0.3
+  mention_spike_multiplier: 3.0   # X times above average = spike
+
+# -----------------------------------------------------------
+# Green Team: Low Float Breakout Special Ops
+# -----------------------------------------------------------
+green_team:
+  # Float screening
+  max_float_millions: 50          # Low float threshold
+  min_price: 1.0                  # No sub-penny
+  max_price: 50.0                 # Focus range
+
+  # Volume thresholds
+  min_rvol: 2.0                   # Relative volume multiplier
+  min_avg_volume: 100000          # Minimum average daily volume
+
+  # Technical indicator parameters
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  ma_short: 9
+  ma_medium: 20
+  ma_long: 50
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  obv_enabled: true
+  vwap_enabled: true
+
+  # Breakout detection
+  consolidation_days: 10          # Min days of consolidation before breakout
+  breakout_volume_multiple: 2.5   # Volume must be X times average
+  breakout_price_pct: 3.0         # Price move % threshold
+
+# -----------------------------------------------------------
+# Blue Team: Momentum + Catalyst Fusion Elite
+# -----------------------------------------------------------
+blue_team:
+  # Historical analysis window
+  lookback_months: 6              # Default history window
+  max_lookback_months: 12
+
+  # Momentum parameters
+  momentum_periods: [5, 10, 21, 63, 126, 252]  # Trading days
+  min_momentum_score: 60          # Minimum composite momentum score
+
+  # Earnings / catalyst
+  earnings_lookahead_days: 14     # Days before earnings to flag
+  min_earnings_surprise_pct: 5.0  # Minimum EPS beat to consider
+
+  # Market regime
+  vix_high_threshold: 25          # VIX above this = high vol regime
+  vix_low_threshold: 15           # VIX below this = low vol regime
+  market_breadth_threshold: 0.5   # Advance/decline ratio threshold
+
+  # Financial quality filters
+  min_revenue_growth_pct: 10.0    # YoY revenue growth
+  max_debt_to_equity: 3.0         # Leverage cap
