@@ -123,9 +123,9 @@ green_team:
 # Blue Team: Momentum + Catalyst Fusion Elite
 # -----------------------------------------------------------
 blue_team:
-  # Historical analysis window
-  lookback_months: 6              # Default history window
-  max_lookback_months: 12
+  # Historical analysis window (must accommodate longest momentum_period)
+  lookback_months: 14             # 252 trading days ≈ 12 months + 2 months buffer
+  max_lookback_months: 18
 
   # Momentum parameters
   momentum_periods: [5, 10, 21, 63, 126, 252]  # Trading days

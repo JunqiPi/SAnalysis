@@ -1,5 +1,52 @@
 # SAnalysis - Change Log
 
+## [0.3.0] - 2026-02-24
+
+### Scoring Logic & Data Integrity Overhaul (P0 Fixes)
+
+**Implemented by**: SDE-Team (5-team specialist agent audit → 20 P0 issues identified and fixed)
+
+#### CRITICAL: Orange Team — GEX Sign Convention Fix
+- **INVERTED GEX scoring** (most severe bug): `_score_gex` was giving 12pts for negative net_gex, but positive net_gex (call_gex > put_gex) means dealers are short gamma = amplifies moves = squeeze-prone. **Fix**: swapped sign convention; positive net_gex now correctly scores highest.
+- **GEX flip point**: `_find_gex_flip` was using per-strike sign changes instead of cumulative GEX. Fixed to use `cumsum()` — flip point is now where cumulative net GEX crosses zero.
+- **OTM call definition**: `_detect_unusual_activity` was using `calls["strike"].median()` for OTM threshold. Fixed to use actual `spot` price (fundamental definition of OTM).
+- **Vectorized GEX calculation**: Replaced 4x `iterrows()` loops with pandas vectorized operations in `_estimate_gex` and `_find_gex_flip`. ~10x speedup for large option chains.
+
+#### Blue Team — Momentum Scoring Fixes
+- **Momentum normalization bias**: `(ret + 50) * (100/150)` mapped 0% return to 33.3 instead of 50 (neutral). Fixed to symmetric `max(0, min(100, ret + 50))` where 0% = 50.
+- **Revenue growth double-counting**: `revenue_growth_pct` was scored in both `_score_catalyst` (0-5pts) and `_score_financial_quality` (0-10pts). Removed from `_score_catalyst`.
+- **Config: lookback_months 6→14**: `momentum_periods` includes 252 trading days (~12 months), but `lookback_months=6` only fetched 126 days. Fixed to 14 months.
+- **min_momentum_score enforcement**: Config defined `min_momentum_score=60` but `analyze()` never checked it. Now implemented as gate in `analyze()`.
+- **Earnings date sort safety**: `future[0]` assumed ascending sort from yfinance. Added explicit `.sort_values()`.
+
+#### Red Team — Data Integrity Fixes
+- **Stale fallback tickers**: Removed BBBY (delisted 2023), RIDE (bankrupt), SKLZ, WISH. Added SOFI, MARA, RIOT.
+- **SI% validation**: Added cap at 100% for implausible short interest data (common with ADRs like ABX showing 43% SI).
+- **Put/call ratio minimum volume**: Added `_MIN_PCR_VOLUME = 100` threshold. Low-volume P/C ratios are statistically unreliable.
+- **API call deduplication**: `_score_catalyst` and `_score_technical` now receive pre-fetched `hist` DataFrame from `analyze()`.
+- **Earnings sort safety**: Added `.sort_values()` for future earnings dates.
+
+#### Green Team — Performance & Filter Fixes
+- **3x API call elimination**: `analyze()` now fetches 6mo history once and passes it to `_build_snapshot_from_hist()`, `_score_breakout_quality()`, and slices for support/resistance. Eliminates 2 redundant yfinance calls per ticker.
+- **OBV duplication removed**: `_score_breakout_quality` no longer recalculates OBV (already computed in `_build_snapshot`).
+- **SPAC filter expansion**: `_EXCLUDED_INDUSTRIES` expanded from 2 to 7 entries (added closed-end funds, ETFs, SPACs).
+- **Float unknown default**: Reduced from 5.0 → 2.0 (no evidence of float tightness should not grant a moderate score).
+
+#### Yellow Team — Data Caching & Scoring Fixes
+- **ApeWisdom data caching**: `_fetch_apewisdom()` now caches the FULL response (mentions, rank, upvotes, mentions_24h_ago) in a single API call. `_get_apewisdom_ticker()` no longer re-fetches the same URL per ticker.
+- **VADER financial lexicon overlay**: Added 20+ financial term corrections (e.g., "short"→neutral, "squeeze"→bullish, "moon"→strongly bullish, "retard"→neutral in WSB context).
+- **Momentum double-counting fix**: `_score_momentum` and `_score_mention_frequency` were both using Google Trends score + ApeWisdom rank. Now separated: `mention_frequency` = absolute attention level (mentions + rank), `momentum` = acceleration (GT score + mention change rate via `mentions_24h_ago`).
+- **Quality scoring rebalanced**: Single-source (ApeWisdom only) configuration now gets 4pts instead of 3pts for source diversity, since Reddit penalty is already applied in `sentiment_polarity`.
+
+#### Core Infrastructure Fixes
+- **cache.py double-close bug**: `_atomic_write` error handler could close an already-closed fd. Fixed with `fd_closed` flag.
+- **cache_dataframe DRY**: Eliminated duplicate temp-file-then-rename logic; now uses `_atomic_write()` with `df.to_parquet()` bytes output.
+- **TickerValidationError**: `validate_ticker()` now raises `TickerValidationError` instead of bare `ValueError`. `TickerValidationError` inherits from both `SAnalysisError` and `ValueError` for backward compatibility.
+- **Type hints**: `ScreenResult.metadata` type hint changed from bare `dict` to `dict[str, Any]`.
+- **Unused import**: Removed `from datetime import datetime` in `market_data.py`.
+
+---
+
 ## [0.2.0] - 2026-02-24
 
 ### Codebase Maturity Overhaul

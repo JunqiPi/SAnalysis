@@ -15,6 +15,7 @@ from typing import Sequence
 
 from src.core.config import get_config
 from src.core.data_types import ScreenResult
+from src.core.exceptions import TickerValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +26,13 @@ _TICKER_RE = re.compile(r'^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$')
 def validate_ticker(ticker: str) -> str:
     """Normalize and validate a ticker symbol.
 
-    Returns the cleaned ticker or raises ValueError.
+    Returns the cleaned ticker or raises TickerValidationError.
     """
     cleaned = ticker.strip().upper()
     if not cleaned:
-        raise ValueError("Ticker symbol cannot be empty.")
+        raise TickerValidationError("Ticker symbol cannot be empty.")
     if not _TICKER_RE.match(cleaned):
-        raise ValueError(
+        raise TickerValidationError(
             f"Invalid ticker symbol: '{ticker}'. "
             f"Expected 1-5 uppercase letters (e.g., 'GME', 'BRK.B')."
         )

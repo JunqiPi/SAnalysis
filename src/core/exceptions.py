@@ -26,5 +26,9 @@ class ScreenerError(SAnalysisError):
     """Error during screening pipeline execution."""
 
 
-class TickerValidationError(SAnalysisError):
-    """Invalid ticker symbol provided."""
+class TickerValidationError(SAnalysisError, ValueError):
+    """Invalid ticker symbol provided.
+
+    Also inherits from ValueError for backward compatibility with code
+    that catches ValueError for input validation errors.
+    """

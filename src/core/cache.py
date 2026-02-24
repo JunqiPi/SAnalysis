@@ -53,12 +53,18 @@ def _atomic_write(target: Path, content_bytes: bytes) -> None:
     This prevents concurrent readers from seeing a half-written file.
     """
     fd, tmp_path = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
+    fd_closed = False
     try:
         os.write(fd, content_bytes)
         os.close(fd)
+        fd_closed = True
         os.replace(tmp_path, target)  # atomic on POSIX
     except Exception:
-        os.close(fd) if not os.get_inheritable(fd) else None
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -71,23 +77,14 @@ def _atomic_write(target: Path, content_bytes: bytes) -> None:
 # ------------------------------------------------------------------
 
 def cache_dataframe(namespace: str, key: str, df: pd.DataFrame) -> None:
-    """Persist a DataFrame to local parquet cache."""
+    """Persist a DataFrame to local parquet cache (atomic write)."""
     h = _key_hash(namespace, key)
     path = _cache_dir() / f"{namespace}_{h}.parquet"
     meta_path = path.with_suffix(".meta")
 
-    # Write parquet to temp then rename (atomic)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".parquet.tmp")
-    os.close(fd)
-    try:
-        df.to_parquet(tmp_path, index=True)
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    # Serialize to bytes then use _atomic_write (DRY)
+    parquet_bytes = df.to_parquet(index=True)
+    _atomic_write(path, parquet_bytes)
 
     # Write metadata sidecar (atomic)
     meta_bytes = json.dumps({"ts": time.time(), "key": key}).encode("utf-8")

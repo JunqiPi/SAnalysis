@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -30,7 +30,7 @@ class ScreenResult:
     team: str                     # "red" | "orange" | "yellow" | "green" | "blue"
     score: float                  # 0-100 composite score
     signals: dict[str, float] = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=_utcnow)
 
     def to_dict(self) -> dict:

@@ -83,18 +83,24 @@ class LowFloatBreakoutScreener(BaseScreener):
     # Technical snapshot
     # ------------------------------------------------------------------
 
-    # Industries that should not appear in low-float breakout scans
+    # Industries/sectors that produce false positives in breakout detection
+    # (NAV-anchored pricing, trust structures, non-operating entities)
     _EXCLUDED_INDUSTRIES = frozenset({
         "Shell Companies",
         "Blank Checks",
+        "Closed-End Fund - Equity",
+        "Closed-End Fund - Debt",
+        "Closed-End Fund - Foreign",
+        "Exchange Traded Fund",
+        "Special Purpose Acquisition",
     })
 
-    def _build_snapshot(self, ticker: str) -> Optional[TechnicalSnapshot]:
-        """Build a comprehensive technical snapshot for a ticker."""
-        hist = market_data.get_history(ticker, period="6mo", interval="1d")
-        if hist.empty or len(hist) < 20:
-            return None
+    def _build_snapshot_from_hist(self, ticker: str, hist: pd.DataFrame) -> Optional[TechnicalSnapshot]:
+        """Build a comprehensive technical snapshot from pre-fetched history.
 
+        Args:
+            hist: 6mo daily OHLCV data (fetched once in analyze()).
+        """
         info = market_data.get_ticker_info(ticker)
 
         # Filter out SPACs / shell companies -- their NAV-anchored prices
@@ -188,7 +194,7 @@ class LowFloatBreakoutScreener(BaseScreener):
         flt = snap.float_shares
 
         if flt is None:
-            return 5.0  # Unknown float: moderate default
+            return 2.0  # Unknown float: conservative default (no evidence of tightness)
 
         flt_millions = flt / 1e6
 
@@ -291,8 +297,12 @@ class LowFloatBreakoutScreener(BaseScreener):
 
         return min(25.0, score)
 
-    def _score_breakout_quality(self, snap: TechnicalSnapshot, ticker: str) -> float:
-        """Score 0-25: Breakout pattern quality and key level analysis."""
+    def _score_breakout_quality(self, snap: TechnicalSnapshot, hist: pd.DataFrame) -> float:
+        """Score 0-25: Breakout pattern quality and key level analysis.
+
+        Args:
+            hist: 6mo history from _build_snapshot (last ~21 rows used for OBV).
+        """
         score = 0.0
 
         # Direct breakout detection
@@ -320,12 +330,14 @@ class LowFloatBreakoutScreener(BaseScreener):
                 score += 3.0
 
         # OBV confirmation (rising OBV with rising price)
-        hist = market_data.get_history(ticker, period="1mo", interval="1d")
+        # Use tail of the 6mo hist — OBV was already computed in _build_snapshot
+        # but we reuse the last 21 days for trend comparison
         if not hist.empty and len(hist) >= 5:
-            obv_vals = technical.obv(hist["Close"], hist["Volume"])
+            recent = hist.tail(21)
+            obv_vals = technical.obv(recent["Close"], recent["Volume"])
             if not obv_vals.empty and len(obv_vals) >= 5:
                 obv_trend = obv_vals.iloc[-1] - obv_vals.iloc[-5]
-                price_trend = hist["Close"].iloc[-1] - hist["Close"].iloc[-5]
+                price_trend = recent["Close"].iloc[-1] - recent["Close"].iloc[-5]
                 if obv_trend > 0 and price_trend > 0:
                     score += 5.0  # Confirmed accumulation
 
@@ -337,7 +349,13 @@ class LowFloatBreakoutScreener(BaseScreener):
 
     def analyze(self, ticker: str) -> ScreenResult | None:
         """Full analysis pipeline for a single ticker."""
-        snap = self._build_snapshot(ticker)
+        # Fetch 6mo history ONCE — used by _build_snapshot, _score_breakout_quality,
+        # and support/resistance (eliminates 2 redundant get_history calls).
+        hist = market_data.get_history(ticker, period="6mo", interval="1d")
+        if hist.empty or len(hist) < 20:
+            return None
+
+        snap = self._build_snapshot_from_hist(ticker, hist)
         if snap is None:
             return None
 
@@ -349,12 +367,12 @@ class LowFloatBreakoutScreener(BaseScreener):
         s1 = self._score_float_tightness(snap)
         s2 = self._score_volume_explosion(snap)
         s3 = self._score_technical_setup(snap)
-        s4 = self._score_breakout_quality(snap, ticker)
+        s4 = self._score_breakout_quality(snap, hist)
         total = s1 + s2 + s3 + s4
 
-        # Support/resistance levels
-        hist = market_data.get_history(ticker, period="3mo", interval="1d")
-        levels = technical.compute_support_resistance(hist) if not hist.empty else {"support": [], "resistance": []}
+        # Support/resistance from last 3mo slice (no extra API call)
+        hist_3mo = hist.tail(63)  # ~3 months of trading days
+        levels = technical.compute_support_resistance(hist_3mo) if not hist_3mo.empty else {"support": [], "resistance": []}
 
         return ScreenResult(
             ticker=ticker,

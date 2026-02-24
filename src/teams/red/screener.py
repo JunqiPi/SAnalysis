@@ -67,11 +67,15 @@ class ShortSqueezeScreener(BaseScreener):
         return self._fallback_tickers()
 
     def _fallback_tickers(self) -> list[str]:
-        """Curated list of historically high short interest tickers for testing."""
+        """Curated list of historically high short interest tickers for testing.
+
+        Periodically audit: remove delisted/bankrupt tickers (BBBY, RIDE, SKLZ,
+        WISH were removed 2026-02).
+        """
         return [
-            "GME", "AMC", "BBBY", "CLOV", "SPCE", "WISH", "WKHS",
-            "GOEV", "SKLZ", "RKT", "PLTR", "BB", "NOK", "FUBO",
-            "MVIS", "RIDE", "SNDL", "TLRY",
+            "GME", "AMC", "CLOV", "SPCE", "WKHS",
+            "GOEV", "RKT", "PLTR", "BB", "NOK", "FUBO",
+            "MVIS", "SNDL", "TLRY", "SOFI", "MARA", "RIOT",
         ]
 
     # ------------------------------------------------------------------
@@ -79,7 +83,11 @@ class ShortSqueezeScreener(BaseScreener):
     # ------------------------------------------------------------------
 
     def _collect_short_data(self, ticker: str) -> Optional[ShortData]:
-        """Gather all short-related metrics for a ticker."""
+        """Gather all short-related metrics for a ticker.
+
+        Includes validation: SI% > 100% is capped (likely data error,
+        especially common with ADRs and foreign stocks).
+        """
         info = market_data.get_ticker_info(ticker)
         if not info:
             return None
@@ -94,6 +102,14 @@ class ShortSqueezeScreener(BaseScreener):
             else:
                 return None
 
+        # Sanity check: SI% > 100% is likely a data error (common with ADRs)
+        if short_pct > 100:
+            logger.warning(
+                "[red] %s has implausible SI=%.1f%% (>100%%), capping at 100%%.",
+                ticker, short_pct,
+            )
+            short_pct = 100.0
+
         return ShortData(
             ticker=ticker,
             short_float_pct=short_pct,
@@ -106,8 +122,14 @@ class ShortSqueezeScreener(BaseScreener):
             source="yfinance",
         )
 
+    _MIN_PCR_VOLUME = 100  # Minimum total option volume for reliable P/C ratio
+
     def _compute_put_call_ratio(self, ticker: str) -> Optional[float]:
-        """Compute put/call volume ratio from nearest expiration options."""
+        """Compute put/call volume ratio from nearest expiration options.
+
+        Returns None if total volume is below minimum threshold (low-volume
+        P/C ratios are statistically unreliable).
+        """
         expirations = market_data.get_options_expirations(ticker)
         if not expirations:
             return None
@@ -119,6 +141,9 @@ class ShortSqueezeScreener(BaseScreener):
         call_vol = calls["volume"].sum() if "volume" in calls.columns else 0
         put_vol = puts["volume"].sum() if "volume" in puts.columns else 0
 
+        # Require minimum total volume for a statistically meaningful ratio
+        if call_vol + put_vol < self._MIN_PCR_VOLUME:
+            return None
         if call_vol == 0:
             return None
         return float(put_vol / call_vol)
@@ -185,8 +210,13 @@ class ShortSqueezeScreener(BaseScreener):
 
         return min(25.0, score)
 
-    def _score_catalyst(self, ticker: str) -> float:
-        """Score 0-25: Proximity to potential catalysts."""
+    def _score_catalyst(self, ticker: str, hist: pd.DataFrame) -> float:
+        """Score 0-25: Proximity to potential catalysts.
+
+        Args:
+            hist: Pre-fetched 3mo history (shared with _score_technical to
+                  avoid duplicate API calls).
+        """
         score = 0.0
 
         # Earnings proximity
@@ -194,7 +224,7 @@ class ShortSqueezeScreener(BaseScreener):
             earnings = market_data.get_earnings_dates(ticker, limit=4)
             if not earnings.empty:
                 now = datetime.now(timezone.utc)
-                future_dates = earnings.index[earnings.index > now]
+                future_dates = earnings.index[earnings.index > now].sort_values()
                 if len(future_dates) > 0:
                     days_until = (future_dates[0] - now).days
                     if days_until <= 7:
@@ -207,7 +237,6 @@ class ShortSqueezeScreener(BaseScreener):
             pass
 
         # Relative volume (proxy for attention/activity)
-        hist = market_data.get_history(ticker, period="3mo", interval="1d")
         if not hist.empty and len(hist) > 5:
             rvol = technical.relative_volume(hist["Volume"], lookback=30)
             if rvol >= 5.0:
@@ -221,9 +250,12 @@ class ShortSqueezeScreener(BaseScreener):
 
         return min(25.0, score)
 
-    def _score_technical(self, ticker: str) -> float:
-        """Score 0-25: Technical momentum and setup quality."""
-        hist = market_data.get_history(ticker, period="3mo", interval="1d")
+    def _score_technical(self, hist: pd.DataFrame) -> float:
+        """Score 0-25: Technical momentum and setup quality.
+
+        Args:
+            hist: Pre-fetched 3mo history (shared with _score_catalyst).
+        """
         if hist.empty or len(hist) < 20:
             return 0.0
 
@@ -282,10 +314,13 @@ class ShortSqueezeScreener(BaseScreener):
         if data.short_float_pct < min_sf:
             return None
 
+        # Pre-fetch history once, share across scoring functions
+        hist = market_data.get_history(ticker, period="3mo", interval="1d")
+
         s1 = self._score_short_intensity(data)
         s2 = self._score_cover_difficulty(data)
-        s3 = self._score_catalyst(ticker)
-        s4 = self._score_technical(ticker)
+        s3 = self._score_catalyst(ticker, hist)
+        s4 = self._score_technical(hist)
         total = s1 + s2 + s3 + s4
 
         return ScreenResult(

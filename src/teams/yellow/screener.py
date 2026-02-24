@@ -92,8 +92,49 @@ def _extract_tickers(text: str) -> list[str]:
     return list(tickers)
 
 
+# Financial lexicon overlay for VADER.
+# VADER misclassifies common finance terms:
+#   "short" → negative (but neutral in finance: "shorting a stock")
+#   "squeeze" → negative (but bullish in meme stock context)
+#   "retard"/"retards" → strongly negative (but neutral/positive in WSB)
+#   "calls" → neutral (but bullish in options context)
+#   "puts" → neutral (but bearish in options context)
+#   "dump" → negative (correct for finance)
+#   "moon" → neutral (but bullish in meme context)
+_FINANCIAL_LEXICON: dict[str, float] = {
+    "short": 0.0,       # Neutral in finance
+    "shorting": 0.0,
+    "shorts": 0.0,
+    "squeeze": 1.5,     # Bullish in meme context
+    "squeezing": 1.0,
+    "retard": 0.0,      # Neutral in WSB
+    "retards": 0.0,
+    "retarded": 0.0,
+    "moon": 2.0,        # Strongly bullish in meme context
+    "mooning": 2.5,
+    "tendies": 1.5,     # WSB: profits
+    "diamond": 1.0,     # "Diamond hands" = holding
+    "rocket": 1.5,      # Bullish meme signal
+    "ape": 0.5,         # WSB identity, mildly bullish
+    "apes": 0.5,
+    "calls": 0.5,       # Mildly bullish (options)
+    "puts": -0.5,       # Mildly bearish (options)
+    "bag": -1.0,        # "Bag holder" = negative
+    "bagholder": -1.5,
+    "bagholding": -1.5,
+}
+
+# Apply financial lexicon overlay to VADER instance
+if _HAS_VADER and _VADER is not None:
+    _VADER.lexicon.update(_FINANCIAL_LEXICON)
+
+
 def _vader_score(text: str) -> float:
-    """Return VADER compound sentiment score (-1 to 1)."""
+    """Return VADER compound sentiment score (-1 to 1).
+
+    Uses a financial lexicon overlay to correct VADER's misclassification
+    of common stock market / WSB terminology.
+    """
     if not _HAS_VADER or _VADER is None:
         return 0.0
     scores = _VADER.polarity_scores(text)
@@ -169,10 +210,16 @@ class SocialSentimentScreener(BaseScreener):
         return unique
 
     def _fetch_apewisdom(self) -> list[str]:
-        """Fetch top trending tickers from ApeWisdom API."""
-        cached = load_cached_json("apewisdom", "trending")
+        """Fetch top trending tickers from ApeWisdom API.
+
+        Caches the FULL response data (mentions, rank, upvotes, etc.)
+        so _get_apewisdom_ticker() can look up per-ticker data without
+        re-fetching the same URL.
+        """
+        cached = load_cached_json("apewisdom", "trending_full")
         if cached is not None:
-            return cached
+            # Full data already cached; extract ticker list
+            return [r["ticker"] for r in cached if "ticker" in r]
 
         url = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1"
         try:
@@ -181,8 +228,26 @@ class SocialSentimentScreener(BaseScreener):
             data = resp.json()
             results = data.get("results", [])
             top_n = self._team_cfg().get("apewisdom_top_n", 50)
-            tickers = [r["ticker"] for r in results[:top_n] if "ticker" in r]
-            cache_json("apewisdom", "trending", tickers)
+            top_results = results[:top_n]
+
+            # Cache full data for all top tickers (single API call)
+            enriched = []
+            for i, r in enumerate(top_results, 1):
+                if "ticker" not in r:
+                    continue
+                entry = {
+                    "ticker": r["ticker"],
+                    "mentions": r.get("mentions", 0),
+                    "rank": i,
+                    "upvotes": r.get("upvotes", 0),
+                    "mentions_24h_ago": r.get("mentions_24h_ago", 0),
+                }
+                enriched.append(entry)
+                # Also cache per-ticker for _get_apewisdom_ticker lookup
+                cache_json("apewisdom", f"ticker_{r['ticker']}", entry)
+
+            cache_json("apewisdom", "trending_full", enriched)
+            tickers = [e["ticker"] for e in enriched]
             logger.info("[yellow] ApeWisdom returned %d trending tickers.", len(tickers))
             return tickers
         except Exception:
@@ -266,29 +331,25 @@ class SocialSentimentScreener(BaseScreener):
         return snap
 
     def _get_apewisdom_ticker(self, ticker: str) -> Optional[dict]:
-        """Get ApeWisdom data for a specific ticker."""
+        """Get ApeWisdom data for a specific ticker.
+
+        Relies on per-ticker cache populated by _fetch_apewisdom().
+        No redundant API calls — if the ticker wasn't in the trending list,
+        it simply returns None (not trending = no ApeWisdom signal).
+        """
         cached = load_cached_json("apewisdom", f"ticker_{ticker}")
         if cached is not None:
             return cached
 
-        # First try from the trending list
-        url = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1"
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            for i, result in enumerate(data.get("results", []), 1):
-                if result.get("ticker") == ticker:
-                    out = {
-                        "mentions": result.get("mentions", 0),
-                        "rank": i,
-                        "upvotes": result.get("upvotes", 0),
-                        "mentions_24h_ago": result.get("mentions_24h_ago", 0),
-                    }
-                    cache_json("apewisdom", f"ticker_{ticker}", out)
-                    return out
-        except Exception:
-            pass
+        # If per-ticker cache miss, check the full trending cache
+        full = load_cached_json("apewisdom", "trending_full")
+        if full is not None:
+            for entry in full:
+                if entry.get("ticker") == ticker:
+                    cache_json("apewisdom", f"ticker_{ticker}", entry)
+                    return entry
+
+        # Not in ApeWisdom trending — no signal
         return None
 
     def _get_reddit_sentiment(self, ticker: str) -> Optional[dict]:
@@ -395,43 +456,38 @@ class SocialSentimentScreener(BaseScreener):
     # ------------------------------------------------------------------
 
     def _score_mention_frequency(self, snap: SentimentSnapshot) -> float:
-        """Score 0-25: How much is this ticker being discussed?"""
+        """Score 0-25: How much is this ticker being discussed?
+
+        Measures the *absolute level* of social media attention.
+        Google Trends is scored in _score_momentum (acceleration) to avoid
+        double-counting.
+        """
         score = 0.0
 
-        # Raw mention count
+        # Raw mention count (ApeWisdom + Reddit combined)
         mc = snap.mention_count
         if mc >= 500:
-            score += 10.0
+            score += 12.0
         elif mc >= 200:
-            score += 8.0
+            score += 9.0
         elif mc >= 100:
-            score += 6.0
+            score += 7.0
         elif mc >= 50:
-            score += 4.0
+            score += 5.0
         elif mc >= 10:
-            score += 2.0
+            score += 3.0
 
-        # Trending rank on ApeWisdom
+        # Trending rank on ApeWisdom (independent of mention count)
         rank = snap.trending_rank
         if rank is not None:
             if rank <= 5:
-                score += 10.0
+                score += 13.0
             elif rank <= 10:
-                score += 7.0
+                score += 9.0
             elif rank <= 20:
-                score += 4.0
-            elif rank <= 50:
-                score += 2.0
-
-        # Google Trends score
-        gt = snap.google_trends_score
-        if gt is not None:
-            if gt >= 80:
                 score += 5.0
-            elif gt >= 50:
+            elif rank <= 50:
                 score += 3.0
-            elif gt >= 25:
-                score += 1.0
 
         return min(25.0, score)
 
@@ -467,10 +523,15 @@ class SocialSentimentScreener(BaseScreener):
         return min(25.0, score)
 
     def _score_momentum(self, snap: SentimentSnapshot) -> float:
-        """Score 0-25: Is sentiment accelerating?"""
+        """Score 0-25: Is sentiment *accelerating*?
+
+        Unlike mention_frequency (static level), momentum measures the
+        *rate of change* in attention and sentiment.
+        """
         score = 0.0
 
-        # Google Trends as momentum proxy
+        # Google Trends score — only counted here (not in mention_frequency)
+        # to avoid double-counting. GT reflects search interest momentum.
         gt = snap.google_trends_score
         if gt is not None:
             if gt >= 90:
@@ -479,21 +540,41 @@ class SocialSentimentScreener(BaseScreener):
                 score += 8.0
             elif gt >= 50:
                 score += 5.0
+            elif gt >= 25:
+                score += 2.0
 
-        # ApeWisdom rank as momentum (lower rank = hotter)
-        rank = snap.trending_rank
-        if rank is not None:
-            if rank <= 3:
-                score += 13.0
-            elif rank <= 10:
-                score += 8.0
-            elif rank <= 25:
-                score += 4.0
+        # Mention acceleration: compare current mentions vs 24h ago
+        # (available from ApeWisdom data cached by _fetch_apewisdom)
+        aw_data = self._get_apewisdom_ticker(snap.ticker)
+        if aw_data is not None:
+            current = aw_data.get("mentions", 0)
+            prev = aw_data.get("mentions_24h_ago", 0)
+            if prev > 0:
+                acceleration = (current - prev) / prev
+                if acceleration >= 2.0:
+                    score += 13.0  # 3x+ surge = explosive momentum
+                elif acceleration >= 1.0:
+                    score += 9.0   # Doubling
+                elif acceleration >= 0.5:
+                    score += 5.0   # 50% increase
+                elif acceleration >= 0.2:
+                    score += 2.0   # Moderate growth
+                elif acceleration <= -0.5:
+                    score += 0.0   # Fading fast
+            elif current > 0:
+                # Newly trending (was zero yesterday)
+                score += 10.0
 
         return min(25.0, score)
 
     def _score_quality(self, snap: SentimentSnapshot) -> float:
-        """Score 0-25: Data quality and signal reliability."""
+        """Score 0-25: Data quality and signal reliability.
+
+        Source diversity scoring is calibrated so that ApeWisdom alone
+        (no Reddit API) can still achieve a reasonable quality score
+        when the data is otherwise strong. The penalty for missing Reddit
+        is already applied in sentiment_polarity (0/25).
+        """
         score = 0.0
 
         # Source diversity: more sources = higher confidence
@@ -501,23 +582,26 @@ class SocialSentimentScreener(BaseScreener):
         if n_sources >= 3:
             score += 10.0
         elif n_sources >= 2:
-            score += 6.0
+            score += 7.0
         elif n_sources >= 1:
-            score += 3.0
+            score += 4.0  # Single source but still valid signal
 
-        # Sample size (mention count as proxy)
+        # Sample size (mention count as proxy for data reliability)
         if snap.mention_count >= 100:
             score += 8.0
         elif snap.mention_count >= 50:
-            score += 5.0
+            score += 6.0
         elif snap.mention_count >= 20:
-            score += 3.0
+            score += 4.0
+        elif snap.mention_count >= 5:
+            score += 2.0
 
-        # Sentiment is not overly extreme (pure echo chamber = unreliable)
-        if 0.2 <= snap.bullish_pct <= 0.8:
-            score += 7.0  # Balanced discussion
-        elif snap.bullish_pct > 0.8:
-            score += 3.0  # Echo chamber penalty
+        # Sentiment balance (requires Reddit data to be meaningful)
+        if snap.bullish_pct > 0:  # Only evaluate if we have sentiment data
+            if 0.2 <= snap.bullish_pct <= 0.8:
+                score += 7.0  # Balanced discussion
+            elif snap.bullish_pct > 0.8:
+                score += 3.0  # Echo chamber penalty
 
         return min(25.0, score)
 

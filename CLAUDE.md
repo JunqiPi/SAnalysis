@@ -1,6 +1,6 @@
 # SAnalysis — Meme Stock Analysis Platform
 
-> Phase 1: Zero-Cost Prototype (v0.1.0, 2026-02-23)
+> v0.3.0 (2026-02-24) · Scoring Logic & Data Integrity Overhaul
 > Python 3.12 · venv at `.venv/` · Ubuntu 24.04 / WSL2
 
 ## Quick Start
@@ -105,3 +105,4 @@ Optional: praw (Reddit API — needs keys in secrets.yaml)
   - Added SPAC/shell company exclusion filter in `src/teams/green/screener.py`: industry "Shell Companies" and "Blank Checks" are now filtered out.
   - Added Reddit API credential warning in `src/teams/yellow/screener.py`: logs a clear WARNING when `config/secrets.yaml` is missing, explaining that `sentiment_polarity` will be 0 for all tickers.
 - **2026-02-24 v0.2.0**: Codebase maturity overhaul. Thread-safe config singleton, atomic cache writes, custom exception hierarchy, ticker validation, lazy screener loading, yfinance object reuse, vectorized S/R calculation, `--version`/`--clear-cache`/`--no-save` CLI flags, timezone-aware timestamps, metadata preservation in ScreenResult. See `Documentation/CHANGELOG.md` for full details.
+- **2026-02-24 v0.3.0**: Scoring logic & data integrity overhaul. 5-team specialist agent audit identified 20 P0 issues. **Critical fix**: Orange team GEX sign convention was inverted. Blue team momentum normalization bias (0%→33.3 instead of 50), revenue double-counting. Red team stale tickers, SI validation. Green team 3x API deduplication, expanded SPAC filter. Yellow team ApeWisdom caching, VADER financial lexicon, momentum/mention double-counting fix. Core: cache.py double-close bug, DRY cache_dataframe, TickerValidationError. See `Documentation/CHANGELOG.md` for full details.

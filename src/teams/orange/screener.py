@@ -50,9 +50,9 @@ class GammaSqueezeScreener(BaseScreener):
         # Curated list of meme/squeeze-adjacent optionable tickers
         return [
             "GME", "AMC", "TSLA", "NVDA", "AAPL", "PLTR", "SOFI",
-            "NIO", "RIVN", "LCID", "BBBY", "CLOV", "FUBO", "MARA",
+            "NIO", "RIVN", "LCID", "CLOV", "FUBO", "MARA",
             "RIOT", "COIN", "HOOD", "SNAP", "PINS", "RBLX",
-            "DKNG", "SPCE", "WISH", "OPEN", "UPST",
+            "DKNG", "SPCE", "UPST", "SMCI", "ARM",
         ]
 
     # ------------------------------------------------------------------
@@ -123,7 +123,9 @@ class GammaSqueezeScreener(BaseScreener):
             GEX_per_strike = Gamma * OI * 100 * spot_price
             Net GEX = sum(call_GEX) - sum(put_GEX)
 
-        The sign convention assumes dealers are net short calls and net long puts.
+        Sign convention (assumes dealers are net short calls / net long puts):
+            net_gex > 0 → dealers short gamma → amplifies moves (squeeze-prone)
+            net_gex < 0 → dealers long gamma → dampens moves
         """
         result = {
             "net_gex": 0.0,
@@ -139,34 +141,31 @@ class GammaSqueezeScreener(BaseScreener):
         has_gamma = "gamma" in calls.columns if not calls.empty else False
 
         if not has_gamma:
-            # Without greeks, use OI concentration as a proxy
             return self._oi_concentration_proxy(snap, spot)
 
-        # Calculate per-strike GEX
-        call_gex = 0.0
-        put_gex = 0.0
-        max_gamma = 0.0
+        # Vectorized call GEX: gamma * OI * 100 * spot per strike
+        c_gamma = calls["gamma"].fillna(0)
+        c_oi = calls["openInterest"].fillna(0)
+        c_gex_per_strike = c_gamma * c_oi * 100 * spot
+        call_gex = float(c_gex_per_strike.sum())
+
+        # Max gamma strike (strongest gamma pin / magnet effect)
         max_gamma_strike = spot
+        if not c_gex_per_strike.empty and c_gex_per_strike.max() > 0:
+            max_idx = c_gex_per_strike.idxmax()
+            max_gamma_strike = float(calls.loc[max_idx, "strike"])
 
-        for _, row in calls.iterrows():
-            gamma = row.get("gamma", 0) or 0
-            oi = row.get("openInterest", 0) or 0
-            strike = row.get("strike", 0)
-            gex = gamma * oi * 100 * spot
-            call_gex += gex
-            if gex > max_gamma:
-                max_gamma = gex
-                max_gamma_strike = strike
-
-        for _, row in puts.iterrows():
-            gamma = row.get("gamma", 0) or 0
-            oi = row.get("openInterest", 0) or 0
-            gex = gamma * oi * 100 * spot
-            put_gex += gex
+        # Vectorized put GEX
+        put_gex = 0.0
+        if not puts.empty and "gamma" in puts.columns:
+            p_gamma = puts["gamma"].fillna(0)
+            p_oi = puts["openInterest"].fillna(0)
+            p_gex_per_strike = p_gamma * p_oi * 100 * spot
+            put_gex = float(p_gex_per_strike.sum())
 
         net_gex = call_gex - put_gex
 
-        # GEX flip: approximate strike where cumulative GEX changes sign
+        # GEX flip: strike where cumulative net GEX crosses zero
         flip_strike = self._find_gex_flip(calls, puts, spot)
 
         result["net_gex"] = net_gex
@@ -180,32 +179,44 @@ class GammaSqueezeScreener(BaseScreener):
     def _find_gex_flip(
         self, calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
     ) -> Optional[float]:
-        """Find the strike price where net GEX flips from positive to negative."""
+        """Find the strike where cumulative net GEX crosses zero.
+
+        The GEX flip point is where *cumulative* (not per-strike) net GEX
+        changes sign, representing the price level where dealer hedging
+        switches from dampening to amplifying moves.
+        """
         if calls.empty or "gamma" not in calls.columns:
             return None
 
-        all_strikes = sorted(set(
-            calls["strike"].tolist() + puts["strike"].tolist()
-        ))
+        # Vectorized per-strike call GEX (groupby handles duplicate strikes)
+        c = calls.assign(
+            gex=calls["gamma"].fillna(0) * calls["openInterest"].fillna(0),
+        )
+        c_by_strike = c.groupby("strike")["gex"].sum()
 
-        call_map = {}
-        if not calls.empty and "gamma" in calls.columns:
-            for _, r in calls.iterrows():
-                call_map[r["strike"]] = (r.get("gamma", 0) or 0) * (r.get("openInterest", 0) or 0)
-
-        put_map = {}
+        # Vectorized per-strike put GEX
+        p_by_strike = pd.Series(dtype=float)
         if not puts.empty and "gamma" in puts.columns:
-            for _, r in puts.iterrows():
-                put_map[r["strike"]] = (r.get("gamma", 0) or 0) * (r.get("openInterest", 0) or 0)
+            p = puts.assign(
+                gex=puts["gamma"].fillna(0) * puts["openInterest"].fillna(0),
+            )
+            p_by_strike = p.groupby("strike")["gex"].sum()
 
-        prev_net = None
-        for strike in all_strikes:
-            c_gex = call_map.get(strike, 0)
-            p_gex = put_map.get(strike, 0)
-            net = c_gex - p_gex
-            if prev_net is not None and prev_net * net < 0:
-                return float(strike)
-            prev_net = net
+        # Net GEX per strike, sorted ascending
+        all_strikes = sorted(set(c_by_strike.index) | set(p_by_strike.index))
+        if len(all_strikes) < 2:
+            return None
+
+        net_per_strike = pd.Series(
+            [c_by_strike.get(s, 0.0) - p_by_strike.get(s, 0.0) for s in all_strikes],
+            index=all_strikes,
+        )
+
+        # Cumulative sum — flip is where cumulative crosses zero
+        cumulative = net_per_strike.cumsum()
+        sign_changes = (cumulative * cumulative.shift(1)) < 0
+        if sign_changes.any():
+            return float(sign_changes.idxmax())
 
         return None
 
@@ -237,7 +248,7 @@ class GammaSqueezeScreener(BaseScreener):
     # Unusual options activity detection
     # ------------------------------------------------------------------
 
-    def _detect_unusual_activity(self, snap: OptionsSnapshot) -> dict:
+    def _detect_unusual_activity(self, snap: OptionsSnapshot, spot: float) -> dict:
         """Detect unusual options activity patterns.
 
         Key signals:
@@ -269,10 +280,9 @@ class GammaSqueezeScreener(BaseScreener):
                 result["max_vol_oi_ratio"] = float(unusual["vol_oi_ratio"].max())
                 result["unusual_strikes"] = unusual["strike"].tolist()
 
-        # OTM call concentration (calls with strike > current max strike midpoint)
-        if "strike" in calls.columns and len(calls) > 0:
-            mid_strike = calls["strike"].median()
-            otm_calls = calls[calls["strike"] > mid_strike]
+        # OTM call concentration (calls with strike above spot price)
+        if "strike" in calls.columns and len(calls) > 0 and spot > 0:
+            otm_calls = calls[calls["strike"] > spot]
             total_vol = calls["volume"].sum()
             if total_vol > 0:
                 otm_vol = otm_calls["volume"].sum()
@@ -368,17 +378,23 @@ class GammaSqueezeScreener(BaseScreener):
         return min(25.0, score)
 
     def _score_gex(self, gex: dict, spot: float) -> float:
-        """Score 0-25: Gamma exposure setup (negative GEX = squeeze-prone)."""
+        """Score 0-25: Gamma exposure setup (positive net GEX = squeeze-prone).
+
+        Sign convention: net_gex = call_gex - put_gex.
+        Dealers are assumed net short calls / long puts, so:
+          net_gex > 0 → dealer gamma is negative → amplifies moves → squeeze-prone
+          net_gex < 0 → dealer gamma is positive → dampens moves
+        """
         score = 0.0
         net = gex.get("net_gex", 0)
 
-        # Negative net GEX means dealers are short gamma -> amplifies moves
-        if net < 0:
+        # Positive net GEX: dealers are short gamma -> amplifies moves
+        if net > 0:
             score += 12.0
         elif net == 0:
             score += 5.0
         else:
-            # Positive GEX: dealers dampen moves (less squeeze-friendly)
+            # Negative GEX: dealers long gamma -> dampens moves (less squeeze-friendly)
             score += 2.0
 
         # Max gamma strike proximity to spot (pin risk / magnet effect)
@@ -488,7 +504,7 @@ class GammaSqueezeScreener(BaseScreener):
             return None
 
         gex = self._estimate_gex(snap, spot)
-        unusual = self._detect_unusual_activity(snap)
+        unusual = self._detect_unusual_activity(snap, spot)
         iv_data = self._analyze_iv(snap, spot)
 
         s1 = self._score_options_activity(snap, unusual)

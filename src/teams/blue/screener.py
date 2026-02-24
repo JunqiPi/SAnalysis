@@ -130,8 +130,9 @@ class MomentumCatalystScreener(BaseScreener):
         for key, weight in weights.items():
             if key in returns and weight > 0:
                 ret = returns[key]
-                # Normalize: clip returns to [-50, 100] range, then scale to 0-100
-                normalized = max(0, min(100, (ret + 50) * (100 / 150)))
+                # Normalize: symmetric range [-50, +50] → [0, 100]
+                # 0% return = 50 (neutral), -50% = 0, +50% = 100
+                normalized = max(0.0, min(100.0, ret + 50.0))
                 weighted_sum += normalized * weight
                 total_weight += weight
 
@@ -149,8 +150,8 @@ class MomentumCatalystScreener(BaseScreener):
 
             now = datetime.now(timezone.utc)
 
-            # Find next upcoming earnings
-            future = earnings.index[earnings.index > now]
+            # Find next upcoming earnings (sort ascending to get closest date)
+            future = earnings.index[earnings.index > now].sort_values()
             if len(future) > 0:
                 next_date = future[0]
                 snap.earnings_date = next_date.strftime("%Y-%m-%d")
@@ -240,15 +241,8 @@ class MomentumCatalystScreener(BaseScreener):
         if snap.eps_estimate is not None:
             score += 5.0
 
-        # Revenue growth as catalyst signal
-        if snap.revenue_growth_pct is not None:
-            growth = snap.revenue_growth_pct
-            if growth >= 50:
-                score += 5.0
-            elif growth >= 20:
-                score += 3.0
-            elif growth >= 10:
-                score += 1.0
+        # Note: revenue_growth is scored in _score_financial_quality only,
+        # to avoid double-counting the same metric across two factors.
 
         return min(25.0, score)
 
@@ -340,6 +334,16 @@ class MomentumCatalystScreener(BaseScreener):
         """Full analysis pipeline for a single ticker."""
         snap = self._build_snapshot(ticker)
         if snap is None:
+            return None
+
+        # Momentum gate: skip tickers below minimum momentum threshold
+        cfg = self._team_cfg()
+        min_mom = cfg.get("min_momentum_score", 0)
+        if min_mom > 0 and snap.momentum_score < min_mom:
+            logger.debug(
+                "[blue] %s momentum_score=%.1f below threshold %d, skipping.",
+                ticker, snap.momentum_score, min_mom,
+            )
             return None
 
         s1 = self._score_momentum(snap)
