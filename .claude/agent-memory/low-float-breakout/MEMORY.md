@@ -8,10 +8,19 @@
 - Cache: info cached as JSON at `data/cache/info_{hash}.json` with key = ticker symbol
 
 ## Known Code Bugs (2026-02-24)
-- `detect_breakout()` in `/root/Pi/SAnalysis/src/utils/technical.py` line 213 uses `abs()` on price change -- catches downside crashes as "breakouts". Must add directional filter.
-- No SPAC/shell company exclusion in screener -- SPACs with NAV-anchored prices produce false positives.
-- Post-reverse-split volume distortion: RVOL calculation mixes pre/post-split volumes, inflating readings.
-- Volume-price direction correlation missing: high RVOL + negative price change should be penalized.
+- `detect_breakout()` in technical.py line 213: FIXED in code (directional filter added), but still uses abs() pattern in memory -- verify on next run.
+- SPAC exclusion: `_EXCLUDED_INDUSTRIES` only has 2 entries ("Shell Companies", "Blank Checks"). Need quoteType + company name pattern matching.
+- Post-reverse-split volume distortion: No detection mechanism. Need to check "Stock Splits" column in hist data.
+- Volume-price direction correlation missing: high RVOL + negative price change should be penalized in `_score_volume_explosion`.
+
+## Code Review Findings (2026-02-24)
+- **API waste**: Each ticker makes 3 separate `get_history` calls (6mo, 1mo, 3mo) + 1 `get_ticker_info`. Can reduce to 1+1 by passing data down.
+- **MACD not used**: `_score_technical_setup` claims MACD in docstring but never calls `technical.macd()`. 4 points of scoring info lost.
+- **Dead code**: `rvol >= 1.5` branch in `_score_volume_explosion` is unreachable because `analyze()` pre-filters at min_rvol=2.0.
+- **float unknown = 5pts**: Too generous. Should be 2pts max for unknown float.
+- **No market cap filter**: System spec says $50M-$2B but code doesn't check `marketCap`.
+- **52w high proximity overweighted**: 8pts (32% of breakout_quality) for being near 52w high; should be 5pts.
+- **VWAP on daily data**: Cumulative VWAP over 6mo is just volume-weighted average price, not intraday VWAP. 5pts overweighted.
 
 ## Analysis Patterns Discovered
 - Earnings-day crashes (CTEV -41%, BOOM -33%) trigger false breakout flags due to abs() in detect_breakout()

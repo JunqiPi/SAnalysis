@@ -86,7 +86,8 @@ class OptionsSnapshot:
     total_put_volume: int = 0
     total_call_oi: int = 0
     total_put_oi: int = 0
-    put_call_ratio: float = 0.0
+    put_call_ratio: float = 0.0      # Volume-based P/C ratio
+    put_call_ratio_oi: float = 0.0   # OI-weighted P/C ratio (more stable)
     timestamp: datetime = field(default_factory=_utcnow)
 
 

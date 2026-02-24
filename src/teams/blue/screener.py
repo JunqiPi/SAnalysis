@@ -164,7 +164,7 @@ class MomentumCatalystScreener(BaseScreener):
                     snap.eps_estimate = float(est.iloc[0])
 
         except Exception:
-            logger.debug("[blue] Earnings data unavailable for %s", ticker)
+            logger.debug("[blue] Earnings data unavailable for %s", ticker, exc_info=True)
 
     def _attach_financial_data(self, snap: MomentumSnapshot, ticker: str) -> None:
         """Attach key financial metrics to snapshot."""
@@ -247,42 +247,45 @@ class MomentumCatalystScreener(BaseScreener):
         return min(25.0, score)
 
     def _score_financial_quality(self, snap: MomentumSnapshot) -> float:
-        """Score 0-25: Financial health and growth profile."""
-        score = 0.0
+        """Score 0-25: Financial health and growth profile.
+
+        Meme-stock friendly: every stock starts with a 5pt baseline.
+        Poor financials reduce from 25 but never below the baseline,
+        because momentum strategies should not disqualify stocks solely
+        on fundamental weakness.
+        """
+        # Baseline: momentum candidates deserve a floor — financial quality
+        # is a modifier, not a disqualifier in a meme-stock context.
+        score = 5.0
         cfg = self._team_cfg()
 
-        # Revenue growth
+        # Revenue growth (0-8 additional)
         if snap.revenue_growth_pct is not None:
             growth = snap.revenue_growth_pct
             min_growth = cfg.get("min_revenue_growth_pct", 10.0)
             if growth >= 100:
-                score += 10.0
-            elif growth >= 50:
                 score += 8.0
+            elif growth >= 50:
+                score += 6.0
             elif growth >= min_growth:
-                score += 5.0
+                score += 4.0
             elif growth >= 0:
                 score += 2.0
-            # Negative growth gets 0
+            elif growth >= -20:
+                score += 1.0  # Slight decline, not catastrophic
 
-        # Debt profile
+        # Debt profile (0-5 additional)
         max_de = cfg.get("max_debt_to_equity", 3.0)
         if snap.debt_to_equity is not None:
             de = snap.debt_to_equity
             if de < 0.5:
-                score += 8.0  # Very low debt
+                score += 5.0  # Very low debt
             elif de < 1.0:
-                score += 6.0
+                score += 4.0
             elif de < max_de:
-                score += 3.0
-            else:
-                score += 0.0  # Over-leveraged
+                score += 2.0
 
-        # If no financial data available, give moderate default
-        if snap.revenue_growth_pct is None and snap.debt_to_equity is None:
-            score = 8.0
-
-        # Analyst coverage (EPS estimate = covered by analysts)
+        # Analyst coverage (0-7 additional)
         if snap.eps_estimate is not None:
             score += 7.0
 
@@ -331,7 +334,13 @@ class MomentumCatalystScreener(BaseScreener):
     # ------------------------------------------------------------------
 
     def analyze(self, ticker: str) -> ScreenResult | None:
-        """Full analysis pipeline for a single ticker."""
+        """Full analysis pipeline for a single ticker.
+
+        Applies:
+        - Momentum gate (min_momentum_score from config)
+        - VIX regime multiplier: discounts total score when VIX is elevated,
+          so momentum signals are proportionally downweighted in high-vol regimes.
+        """
         snap = self._build_snapshot(ticker)
         if snap is None:
             return None
@@ -350,7 +359,20 @@ class MomentumCatalystScreener(BaseScreener):
         s2 = self._score_catalyst(snap)
         s3 = self._score_financial_quality(snap)
         s4 = self._score_market_regime(snap)
-        total = s1 + s2 + s3 + s4
+        raw_total = s1 + s2 + s3 + s4
+
+        # VIX regime multiplier: momentum strategies are unreliable in high-vol.
+        # This is the "safety valve" — it affects the total score, not just the
+        # market_regime factor, ensuring elevated VIX truly suppresses rankings.
+        vix_high = cfg.get("vix_high_threshold", 25)
+        regime_multiplier = 1.0
+        if snap.vix_level is not None:
+            if snap.vix_level >= 35:
+                regime_multiplier = 0.5   # Red alert: massive discount
+            elif snap.vix_level >= vix_high:
+                regime_multiplier = 0.7   # Yellow warning: significant discount
+
+        total = raw_total * regime_multiplier
 
         return ScreenResult(
             ticker=ticker,
@@ -374,5 +396,6 @@ class MomentumCatalystScreener(BaseScreener):
                 "revenue_growth_pct": snap.revenue_growth_pct,
                 "debt_to_equity": snap.debt_to_equity,
                 "market_regime": snap.market_regime,
+                "regime_multiplier": regime_multiplier,
             },
         )

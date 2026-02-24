@@ -226,8 +226,16 @@ class LowFloatBreakoutScreener(BaseScreener):
 
         return min(25.0, score)
 
-    def _score_volume_explosion(self, snap: TechnicalSnapshot) -> float:
-        """Score 0-25: Volume surge magnitude."""
+    def _score_volume_explosion(self, snap: TechnicalSnapshot, hist: pd.DataFrame) -> float:
+        """Score 0-25: Volume surge magnitude with price direction verification.
+
+        High RVOL on a price *decline* is NOT a bullish breakout signal —
+        it's distribution (selling). We verify the latest bar's price direction
+        and apply a discount if the move is downward.
+
+        Args:
+            hist: 6mo history for price direction check.
+        """
         score = 0.0
 
         rvol = snap.rvol
@@ -244,6 +252,24 @@ class LowFloatBreakoutScreener(BaseScreener):
         else:
             return 0.0  # Below RVOL threshold
 
+        # Price direction verification: discount score if volume surge
+        # accompanies a price decline (distribution, not accumulation).
+        if not hist.empty and len(hist) >= 2:
+            latest_close = hist["Close"].iloc[-1]
+            prev_close = hist["Close"].iloc[-2]
+            if prev_close > 0:
+                day_return_pct = (latest_close / prev_close - 1) * 100
+                if day_return_pct < -3.0:
+                    # Strong decline with high volume = distribution, not breakout
+                    score *= 0.3
+                    logger.debug(
+                        "[green] %s RVOL=%.1f but price down %.1f%%, discounting volume score.",
+                        snap.ticker, rvol, day_return_pct,
+                    )
+                elif day_return_pct < 0:
+                    # Mild decline: partial discount
+                    score *= 0.6
+
         # Absolute volume check
         cfg = self._team_cfg()
         min_avg_vol = cfg.get("min_avg_volume", 100000)
@@ -256,44 +282,63 @@ class LowFloatBreakoutScreener(BaseScreener):
 
         return min(25.0, score)
 
-    def _score_technical_setup(self, snap: TechnicalSnapshot) -> float:
-        """Score 0-25: Technical indicator alignment."""
+    def _score_technical_setup(self, snap: TechnicalSnapshot, hist: pd.DataFrame) -> float:
+        """Score 0-25: Technical indicator alignment (RSI, MA, BB, MACD, VWAP).
+
+        Args:
+            hist: 6mo history for MACD computation.
+        """
         score = 0.0
 
-        # RSI: ideal range for breakout setup
+        # RSI: ideal range for breakout setup (0-6)
         if snap.rsi is not None:
             if 55 <= snap.rsi <= 75:
-                score += 7.0  # Strong momentum, not yet exhausted
+                score += 6.0  # Strong momentum, not yet exhausted
             elif 40 <= snap.rsi < 55:
                 score += 4.0  # Building momentum
             elif snap.rsi < 35:
                 score += 2.0  # Oversold bounce potential
             # >75 gets 0: already overextended
 
-        # Moving average alignment (bullish stack: price > MA9 > MA20 > MA50)
+        # Moving average alignment (bullish stack: price > MA9 > MA20 > MA50, 0-6)
         if all(v is not None for v in [snap.ma_9, snap.ma_20, snap.ma_50]):
             if snap.price > snap.ma_9 > snap.ma_20 > snap.ma_50:
-                score += 7.0  # Perfect bullish alignment
+                score += 6.0  # Perfect bullish alignment
             elif snap.price > snap.ma_9 > snap.ma_20:
-                score += 5.0
+                score += 4.0
             elif snap.price > snap.ma_20:
-                score += 3.0
+                score += 2.0
 
-        # Bollinger Band position
+        # Bollinger Band position (0-5)
         if snap.bb_upper is not None and snap.bb_lower is not None:
             bb_range = snap.bb_upper - snap.bb_lower
             if bb_range > 0:
                 bb_position = (snap.price - snap.bb_lower) / bb_range
                 if bb_position >= 0.9:
-                    score += 6.0  # Breaking out of upper band
+                    score += 5.0  # Breaking out of upper band
                 elif bb_position >= 0.7:
-                    score += 4.0
+                    score += 3.0
                 elif bb_position <= 0.2:
-                    score += 2.0  # Near lower band bounce
+                    score += 1.0  # Near lower band bounce
 
-        # VWAP: price above VWAP is bullish
+        # MACD bullish crossover (0-4)
+        if not hist.empty and len(hist) >= 30:
+            close = hist["Close"]
+            macd_line, signal_line, _ = technical.macd(close)
+            if (not macd_line.empty and not signal_line.empty
+                    and not pd.isna(macd_line.iloc[-1]) and not pd.isna(signal_line.iloc[-1])):
+                if macd_line.iloc[-1] > signal_line.iloc[-1]:
+                    # Check freshness: recent crossover (within 3 bars) is stronger
+                    if (len(macd_line) >= 4 and not pd.isna(macd_line.iloc[-4])
+                            and not pd.isna(signal_line.iloc[-4])
+                            and macd_line.iloc[-4] <= signal_line.iloc[-4]):
+                        score += 4.0  # Fresh bullish crossover (last 3 days)
+                    else:
+                        score += 2.0  # Ongoing bullish MACD
+
+        # VWAP: price above VWAP is bullish (0-4)
         if snap.vwap is not None and snap.price > snap.vwap:
-            score += 5.0
+            score += 4.0
 
         return min(25.0, score)
 
@@ -365,8 +410,8 @@ class LowFloatBreakoutScreener(BaseScreener):
             return None
 
         s1 = self._score_float_tightness(snap)
-        s2 = self._score_volume_explosion(snap)
-        s3 = self._score_technical_setup(snap)
+        s2 = self._score_volume_explosion(snap, hist)
+        s3 = self._score_technical_setup(snap, hist)
         s4 = self._score_breakout_quality(snap, hist)
         total = s1 + s2 + s3 + s4
 

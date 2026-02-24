@@ -60,6 +60,9 @@ class ShortSqueezeScreener(BaseScreener):
                 tickers = df[ticker_col].tolist()
                 logger.info("[red] Finviz returned %d candidates.", len(tickers))
                 return tickers
+            else:
+                logger.warning("[red] Finviz returned empty results (possible rate limit), "
+                               "falling back to curated list.")
         except Exception:
             logger.exception("[red] Finviz screening failed, falling back to curated list.")
 
@@ -87,6 +90,7 @@ class ShortSqueezeScreener(BaseScreener):
 
         Includes validation: SI% > 100% is capped (likely data error,
         especially common with ADRs and foreign stocks).
+        Also populates as_of from yfinance's dateShortInterest field.
         """
         info = market_data.get_ticker_info(ticker)
         if not info:
@@ -110,6 +114,15 @@ class ShortSqueezeScreener(BaseScreener):
             )
             short_pct = 100.0
 
+        # Extract short data report date for freshness tracking
+        as_of_dt: Optional[datetime] = None
+        date_si = info.get("dateShortInterest")
+        if date_si is not None:
+            try:
+                as_of_dt = datetime.fromtimestamp(int(date_si), tz=timezone.utc)
+            except (OSError, ValueError, TypeError, OverflowError):
+                pass
+
         return ShortData(
             ticker=ticker,
             short_float_pct=short_pct,
@@ -120,6 +133,7 @@ class ShortSqueezeScreener(BaseScreener):
             avg_volume=info.get("averageVolume"),
             put_call_ratio=self._compute_put_call_ratio(ticker),
             source="yfinance",
+            as_of=as_of_dt,
         )
 
     _MIN_PCR_VOLUME = 100  # Minimum total option volume for reliable P/C ratio
@@ -152,20 +166,31 @@ class ShortSqueezeScreener(BaseScreener):
     # Scoring
     # ------------------------------------------------------------------
 
+    # Piecewise linear breakpoints for short intensity scoring.
+    # Eliminates cliff-edge discontinuities (e.g., 9.9%→10% was a 2pt jump).
+    _SI_BREAKPOINTS: list[tuple[float, float]] = [
+        (0.0, 0.0), (10.0, 10.0), (15.0, 14.0),
+        (20.0, 18.0), (30.0, 22.0), (40.0, 25.0),
+    ]
+
     def _score_short_intensity(self, data: ShortData) -> float:
-        """Score 0-25: How heavily shorted is this stock?"""
+        """Score 0-25: How heavily shorted is this stock?
+
+        Uses piecewise linear interpolation between breakpoints
+        to ensure smooth scoring without cliff-edge discontinuities.
+        """
         pct = data.short_float_pct
+        if pct <= 0:
+            return 0.0
         if pct >= 40:
             return 25.0
-        if pct >= 30:
-            return 22.0
-        if pct >= 20:
-            return 18.0
-        if pct >= 15:
-            return 14.0
-        if pct >= 10:
-            return 10.0
-        return max(0, pct * 0.8)
+        # Interpolate between breakpoints
+        for i in range(len(self._SI_BREAKPOINTS) - 1):
+            x0, y0 = self._SI_BREAKPOINTS[i]
+            x1, y1 = self._SI_BREAKPOINTS[i + 1]
+            if x0 <= pct < x1:
+                return y0 + (y1 - y0) * (pct - x0) / (x1 - x0)
+        return 25.0
 
     def _score_cover_difficulty(self, data: ShortData) -> float:
         """Score 0-25: How hard is it for shorts to cover?"""
@@ -234,7 +259,7 @@ class ShortSqueezeScreener(BaseScreener):
                     elif days_until <= 30:
                         score += 4.0
         except Exception:
-            pass
+            logger.debug("[red] %s: Failed to parse earnings dates.", ticker, exc_info=True)
 
         # Relative volume (proxy for attention/activity)
         if not hist.empty and len(hist) > 5:
@@ -303,16 +328,56 @@ class ShortSqueezeScreener(BaseScreener):
     # Main analysis
     # ------------------------------------------------------------------
 
+    # Maximum days since last FINRA short interest report before warning.
+    # FINRA publishes twice monthly (~every 15 days).
+    _MAX_SI_AGE_DAYS = 16
+
     def analyze(self, ticker: str) -> ScreenResult | None:
-        """Full analysis pipeline for a single ticker."""
+        """Full analysis pipeline for a single ticker.
+
+        Applies config-driven gates: min_short_float_pct, min_days_to_cover,
+        max_market_cap_millions. Warns on stale short interest data.
+        """
         data = self._collect_short_data(ticker)
         if data is None:
             logger.debug("[red] No short data for %s, skipping.", ticker)
             return None
 
-        min_sf = self._team_cfg().get("min_short_float_pct", 10.0)
+        cfg = self._team_cfg()
+        min_sf = cfg.get("min_short_float_pct", 10.0)
         if data.short_float_pct < min_sf:
             return None
+
+        # Gate: days-to-cover threshold (config default: 3.0)
+        min_dtc = cfg.get("min_days_to_cover", 3.0)
+        if data.days_to_cover is not None and data.days_to_cover < min_dtc:
+            logger.debug(
+                "[red] %s DTC=%.1f below threshold %.1f, skipping.",
+                ticker, data.days_to_cover, min_dtc,
+            )
+            return None
+
+        # Gate: market cap ceiling
+        max_mcap = cfg.get("max_market_cap_millions", 10000)
+        info = market_data.get_ticker_info(ticker)
+        mcap = info.get("marketCap") if info else None
+        if mcap is not None and mcap > max_mcap * 1e6:
+            logger.debug(
+                "[red] %s market cap $%.1fB exceeds max $%.1fB, skipping.",
+                ticker, mcap / 1e9, max_mcap / 1e3,
+            )
+            return None
+
+        # Staleness warning for short data
+        si_age_days: Optional[int] = None
+        if data.as_of is not None:
+            si_age_days = (datetime.now(timezone.utc) - data.as_of).days
+            if si_age_days > self._MAX_SI_AGE_DAYS:
+                logger.warning(
+                    "[red] %s short data is %d days old (as_of=%s).",
+                    ticker, si_age_days,
+                    data.as_of.strftime("%Y-%m-%d"),
+                )
 
         # Pre-fetch history once, share across scoring functions
         hist = market_data.get_history(ticker, period="3mo", interval="1d")
@@ -322,6 +387,9 @@ class ShortSqueezeScreener(BaseScreener):
         s3 = self._score_catalyst(ticker, hist)
         s4 = self._score_technical(hist)
         total = s1 + s2 + s3 + s4
+
+        # Use NaN for missing data (distinguishes "not available" from "is 0")
+        _nan = float("nan")
 
         return ScreenResult(
             ticker=ticker,
@@ -333,13 +401,15 @@ class ShortSqueezeScreener(BaseScreener):
                 "catalyst_proximity": s3,
                 "technical_momentum": s4,
                 "short_float_pct": data.short_float_pct,
-                "days_to_cover": data.days_to_cover or 0,
-                "put_call_ratio": data.put_call_ratio or 0,
+                "days_to_cover": data.days_to_cover if data.days_to_cover is not None else _nan,
+                "put_call_ratio": data.put_call_ratio if data.put_call_ratio is not None else _nan,
             },
             metadata={
                 "float_shares": data.float_shares,
                 "short_shares": data.short_shares,
                 "avg_volume": data.avg_volume,
                 "source": data.source,
+                "si_as_of": data.as_of.isoformat() if data.as_of else None,
+                "si_age_days": si_age_days,
             },
         )

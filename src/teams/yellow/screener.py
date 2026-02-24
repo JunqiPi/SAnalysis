@@ -146,12 +146,44 @@ class SocialSentimentScreener(BaseScreener):
 
     _reddit_warning_logged = False  # class-level flag to avoid log spam
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Cached praw.Reddit client (created once, reused across all tickers).
+        # Avoids recreating the OAuth session per ticker in _get_reddit_sentiment.
+        self._reddit_client: Optional[object] = None
+        # Google Trends circuit breaker: after N consecutive failures,
+        # stop trying for the remainder of this scan run.
+        self._gt_consecutive_failures: int = 0
+        self._gt_circuit_open: bool = False
+
     @property
     def team_name(self) -> str:
         return "yellow"
 
     def _team_cfg(self):
         return self.cfg["yellow_team"]
+
+    def _get_reddit_client(self) -> Optional[object]:
+        """Return a cached praw.Reddit instance (lazy-init, reused across tickers)."""
+        if self._reddit_client is not None:
+            return self._reddit_client
+        if not _HAS_PRAW:
+            return None
+        api_keys = self.cfg.get_nested("api_keys") or {}
+        client_id = api_keys.get("reddit_client_id", "")
+        client_secret = api_keys.get("reddit_client_secret", "")
+        if not client_id or not client_secret:
+            return None
+        try:
+            self._reddit_client = praw.Reddit(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=api_keys.get("reddit_user_agent", "SAnalysis/0.1"),
+            )
+            return self._reddit_client
+        except Exception:
+            logger.exception("[yellow] Failed to initialize Reddit client.")
+            return None
 
     def _check_reddit_credentials(self) -> bool:
         """Check if Reddit API credentials are configured.
@@ -255,28 +287,13 @@ class SocialSentimentScreener(BaseScreener):
             return []
 
     def _scan_reddit_for_tickers(self) -> list[str]:
-        """Scan configured subreddits for ticker mentions."""
+        """Scan configured subreddits for ticker mentions.
+
+        Uses cached Reddit client (created once via _get_reddit_client()).
+        """
         cfg = self._team_cfg()
-        if not _HAS_PRAW:
-            return []
-
-        api_keys = self.cfg.get_nested("api_keys") or {}
-        client_id = api_keys.get("reddit_client_id", "")
-        client_secret = api_keys.get("reddit_client_secret", "")
-        user_agent = api_keys.get("reddit_user_agent", "SAnalysis/0.1")
-
-        if not client_id or not client_secret:
-            logger.info("[yellow] Reddit credentials not configured, skipping Reddit scan.")
-            return []
-
-        try:
-            reddit = praw.Reddit(
-                client_id=client_id,
-                client_secret=client_secret,
-                user_agent=user_agent,
-            )
-        except Exception:
-            logger.exception("[yellow] Failed to initialize Reddit client.")
+        reddit = self._get_reddit_client()
+        if reddit is None:
             return []
 
         subreddits = cfg.get("subreddits", ["wallstreetbets"])
@@ -356,29 +373,17 @@ class SocialSentimentScreener(BaseScreener):
         """Compute sentiment from Reddit posts mentioning this ticker.
 
         Uses cached scan results if available, otherwise falls back
-        to a targeted search.
+        to a targeted search via the cached Reddit client.
         """
         cached = load_cached_json("reddit_sentiment", ticker)
         if cached is not None:
             return cached
 
-        if not _HAS_PRAW or not _HAS_VADER:
+        if not _HAS_VADER:
             return None
 
-        if not self._check_reddit_credentials():
-            return None
-
-        api_keys = self.cfg.get_nested("api_keys") or {}
-        client_id = api_keys.get("reddit_client_id", "")
-        client_secret = api_keys.get("reddit_client_secret", "")
-
-        try:
-            reddit = praw.Reddit(
-                client_id=client_id,
-                client_secret=client_secret,
-                user_agent=api_keys.get("reddit_user_agent", "SAnalysis/0.1"),
-            )
-        except Exception:
+        reddit = self._get_reddit_client()
+        if reddit is None:
             return None
 
         cfg = self._team_cfg()
@@ -420,13 +425,29 @@ class SocialSentimentScreener(BaseScreener):
         cache_json("reddit_sentiment", ticker, result)
         return result
 
+    # Circuit breaker: stop hitting Google Trends after this many consecutive failures.
+    # Prevents cascade timeouts when Google rate-limits us (common with >10 queries).
+    _GT_MAX_CONSECUTIVE_FAILURES = 3
+
     def _get_google_trends(self, ticker: str) -> Optional[float]:
-        """Get Google Trends interest score for the ticker."""
+        """Get Google Trends interest score for the ticker.
+
+        Includes a circuit breaker: after _GT_MAX_CONSECUTIVE_FAILURES
+        consecutive failures, all subsequent calls for this scan run
+        return None immediately. This prevents cascade timeouts when
+        Google rate-limits our requests.
+        """
         if not _HAS_PYTRENDS:
+            return None
+
+        # Circuit breaker: skip if too many recent failures
+        if self._gt_circuit_open:
             return None
 
         cached = load_cached_json("gtrends", ticker)
         if cached is not None:
+            # Successful cache hit resets the failure counter
+            self._gt_consecutive_failures = 0
             return cached
 
         cfg = self._team_cfg()
@@ -446,9 +467,20 @@ class SocialSentimentScreener(BaseScreener):
             # Return the most recent interest value (0-100 scale)
             score = float(df[kw].iloc[-1])
             cache_json("gtrends", ticker, score)
+            self._gt_consecutive_failures = 0  # Reset on success
             return score
         except Exception:
-            logger.debug("[yellow] Google Trends failed for %s", ticker)
+            self._gt_consecutive_failures += 1
+            if self._gt_consecutive_failures >= self._GT_MAX_CONSECUTIVE_FAILURES:
+                self._gt_circuit_open = True
+                logger.warning(
+                    "[yellow] Google Trends circuit breaker OPEN after %d "
+                    "consecutive failures. Skipping GT for remaining tickers.",
+                    self._gt_consecutive_failures,
+                )
+            else:
+                logger.debug("[yellow] Google Trends failed for %s (%d/%d before circuit break)",
+                             ticker, self._gt_consecutive_failures, self._GT_MAX_CONSECUTIVE_FAILURES)
             return None
 
     # ------------------------------------------------------------------

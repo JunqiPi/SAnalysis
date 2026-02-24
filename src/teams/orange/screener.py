@@ -96,6 +96,7 @@ class GammaSqueezeScreener(BaseScreener):
         put_oi = int(puts["openInterest"].sum()) if "openInterest" in puts.columns else 0
 
         pcr = (put_vol / call_vol) if call_vol > 0 else 0.0
+        pcr_oi = (put_oi / call_oi) if call_oi > 0 else 0.0
 
         return OptionsSnapshot(
             ticker=ticker,
@@ -107,6 +108,7 @@ class GammaSqueezeScreener(BaseScreener):
             total_call_oi=call_oi,
             total_put_oi=put_oi,
             put_call_ratio=pcr,
+            put_call_ratio_oi=pcr_oi,
         )
 
     # ------------------------------------------------------------------
@@ -378,39 +380,60 @@ class GammaSqueezeScreener(BaseScreener):
         return min(25.0, score)
 
     def _score_gex(self, gex: dict, spot: float) -> float:
-        """Score 0-25: Gamma exposure setup (positive net GEX = squeeze-prone).
+        """Score 0-25: Gamma exposure setup with magnitude normalization.
 
         Sign convention: net_gex = call_gex - put_gex.
         Dealers are assumed net short calls / long puts, so:
           net_gex > 0 → dealer gamma is negative → amplifies moves → squeeze-prone
           net_gex < 0 → dealer gamma is positive → dampens moves
+
+        Magnitude matters: a tiny positive GEX is less meaningful than a large one.
+        We normalize relative to total GEX to gauge how imbalanced the exposure is.
         """
         score = 0.0
         net = gex.get("net_gex", 0)
+        call_gex = gex.get("call_gex_total", 0)
+        put_gex = gex.get("put_gex_total", 0)
+        total_gex = abs(call_gex) + abs(put_gex)
 
         # Positive net GEX: dealers are short gamma -> amplifies moves
         if net > 0:
-            score += 12.0
+            # Magnitude normalization: how strongly is the GEX skewed?
+            if total_gex > 0:
+                imbalance = abs(net) / total_gex  # 0 to 1
+                if imbalance >= 0.7:
+                    score += 14.0  # Extreme: heavily short gamma
+                elif imbalance >= 0.4:
+                    score += 11.0  # Strong imbalance
+                else:
+                    score += 8.0   # Mild positive (some squeeze potential)
+            else:
+                score += 8.0
         elif net == 0:
-            score += 5.0
+            score += 3.0  # Neutral: balanced hedging
         else:
-            # Negative GEX: dealers long gamma -> dampens moves (less squeeze-friendly)
-            score += 2.0
+            # Negative GEX: dealers long gamma -> dampens moves
+            score += 1.0
 
         # Max gamma strike proximity to spot (pin risk / magnet effect)
         mg_strike = gex.get("max_gamma_strike")
         if mg_strike and spot > 0:
             proximity = abs(mg_strike - spot) / spot
             if proximity < 0.02:
-                score += 8.0  # Very close: strong pin or breakout potential
+                score += 7.0  # Very close: strong pin or breakout potential
             elif proximity < 0.05:
-                score += 5.0
+                score += 4.0
             elif proximity < 0.10:
-                score += 3.0
+                score += 2.0
 
-        # GEX flip presence (indicates regime boundary)
-        if gex.get("gex_flip_strike") is not None:
-            score += 5.0
+        # GEX flip presence near spot (indicates regime boundary)
+        flip = gex.get("gex_flip_strike")
+        if flip is not None and spot > 0:
+            flip_distance = abs(flip - spot) / spot
+            if flip_distance < 0.05:
+                score += 4.0  # Flip point near spot = high transition risk
+            else:
+                score += 2.0  # Flip exists but further away
 
         return min(25.0, score)
 
@@ -445,46 +468,55 @@ class GammaSqueezeScreener(BaseScreener):
         return min(25.0, score)
 
     def _score_oi_setup(self, snap: OptionsSnapshot) -> float:
-        """Score 0-25: Open interest setup quality."""
+        """Score 0-25: Open interest setup quality.
+
+        Uses both volume-based and OI-weighted put/call ratios for a
+        more stable signal than volume alone (which is noisy intraday).
+        """
         score = 0.0
 
         total_oi = snap.total_call_oi + snap.total_put_oi
         if total_oi == 0:
             return 0.0
 
-        # High absolute OI = many positions to unwind
+        # High absolute OI = many positions to unwind (0-7)
         if total_oi >= 500000:
-            score += 8.0
+            score += 7.0
         elif total_oi >= 100000:
-            score += 6.0
+            score += 5.0
         elif total_oi >= 50000:
-            score += 4.0
+            score += 3.0
         else:
-            score += 2.0
+            score += 1.0
 
-        # Call OI dominance (bullish positioning)
+        # Call OI dominance (bullish positioning, 0-6)
         if snap.total_call_oi > 0:
             call_oi_ratio = snap.total_call_oi / total_oi
             if call_oi_ratio > 0.65:
-                score += 7.0  # Heavy call OI = dealer short gamma
+                score += 6.0  # Heavy call OI = dealer short gamma
             elif call_oi_ratio > 0.55:
-                score += 4.0
+                score += 3.0
 
-        # Put/call OI imbalance (extreme = potential catalyst)
-        pc_oi = snap.total_put_oi / max(snap.total_call_oi, 1)
-        if pc_oi > 2.0:
-            score += 5.0  # Extreme put hedging
-        elif pc_oi < 0.3:
-            score += 5.0  # Extreme call dominance
+        # OI-weighted P/C ratio: more stable than volume-only (0-5)
+        # Uses the pre-computed put_call_ratio_oi from OptionsSnapshot
+        pcr_oi = snap.put_call_ratio_oi
+        if pcr_oi > 2.0:
+            score += 5.0  # Extreme put hedging (high demand for downside protection)
+        elif pcr_oi < 0.3:
+            score += 5.0  # Extreme call dominance (squeeze anticipation)
+        elif pcr_oi > 1.5:
+            score += 3.0  # Elevated hedging
+        elif pcr_oi < 0.5:
+            score += 3.0  # Bullish lean
 
-        # Volume relative to OI (new positioning intensity)
+        # Volume relative to OI (new positioning intensity, 0-4)
         total_vol = snap.total_call_volume + snap.total_put_volume
         if total_oi > 0:
             vol_oi = total_vol / total_oi
             if vol_oi > 0.5:
-                score += 5.0
+                score += 4.0
             elif vol_oi > 0.3:
-                score += 3.0
+                score += 2.0
 
         return min(25.0, score)
 
@@ -525,6 +557,7 @@ class GammaSqueezeScreener(BaseScreener):
                 "net_gex": gex.get("net_gex", 0),
                 "atm_iv": iv_data.get("atm_iv", 0),
                 "put_call_ratio": snap.put_call_ratio,
+                "put_call_ratio_oi": snap.put_call_ratio_oi,
                 "total_volume": snap.total_call_volume + snap.total_put_volume,
                 "max_vol_oi_ratio": unusual.get("max_vol_oi_ratio", 0),
             },

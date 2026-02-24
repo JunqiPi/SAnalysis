@@ -1,6 +1,6 @@
 # SAnalysis — Meme Stock Analysis Platform
 
-> v0.3.0 (2026-02-24) · Scoring Logic & Data Integrity Overhaul
+> v0.4.0 (2026-02-24) · P1 Scoring Refinement & Robustness
 > Python 3.12 · venv at `.venv/` · Ubuntu 24.04 / WSL2
 
 ## Quick Start
@@ -106,3 +106,4 @@ Optional: praw (Reddit API — needs keys in secrets.yaml)
   - Added Reddit API credential warning in `src/teams/yellow/screener.py`: logs a clear WARNING when `config/secrets.yaml` is missing, explaining that `sentiment_polarity` will be 0 for all tickers.
 - **2026-02-24 v0.2.0**: Codebase maturity overhaul. Thread-safe config singleton, atomic cache writes, custom exception hierarchy, ticker validation, lazy screener loading, yfinance object reuse, vectorized S/R calculation, `--version`/`--clear-cache`/`--no-save` CLI flags, timezone-aware timestamps, metadata preservation in ScreenResult. See `Documentation/CHANGELOG.md` for full details.
 - **2026-02-24 v0.3.0**: Scoring logic & data integrity overhaul. 5-team specialist agent audit identified 20 P0 issues. **Critical fix**: Orange team GEX sign convention was inverted. Blue team momentum normalization bias (0%→33.3 instead of 50), revenue double-counting. Red team stale tickers, SI validation. Green team 3x API deduplication, expanded SPAC filter. Yellow team ApeWisdom caching, VADER financial lexicon, momentum/mention double-counting fix. Core: cache.py double-close bug, DRY cache_dataframe, TickerValidationError. See `Documentation/CHANGELOG.md` for full details.
+- **2026-02-24 v0.4.0**: P1 scoring refinement & robustness. **Red**: ShortData.as_of population + staleness warning, config gates enforced (min_DTC, max_mcap), piecewise linear scoring interpolation, NaN for missing signals. **Blue**: financial quality baseline (5pt floor for meme stocks), VIX regime multiplier (0.5x/0.7x total score). **Green**: MACD added to technical setup, RVOL price direction verification (crash discount). **Yellow**: Google Trends circuit breaker (3 failures → skip remaining), Reddit client caching (single praw instance per run). **Orange**: OI-weighted PCR, GEX magnitude normalization (imbalance ratio), flip point distance scoring. See `Documentation/CHANGELOG.md` for full details.

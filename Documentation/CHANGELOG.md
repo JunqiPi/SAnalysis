@@ -1,5 +1,48 @@
 # SAnalysis - Change Log
 
+## [0.4.0] - 2026-02-24
+
+### P1 Scoring Refinement & Robustness Improvements
+
+**Implemented by**: SDE-Team (15 P1 fixes across all 5 teams + core infrastructure)
+
+#### Red Team — Config Enforcement, Scoring Smoothing, Data Freshness
+- **ShortData.as_of population**: Now extracts `dateShortInterest` from yfinance `info` dict, converting Unix timestamp to timezone-aware datetime. Enables staleness tracking.
+- **Short data staleness warning**: Logs WARNING when SI data is >16 days old (FINRA publishes every ~15 days).
+- **Config-driven gates enforced**: `min_days_to_cover` and `max_market_cap_millions` from `config/default.yaml` are now checked in `analyze()`. Previously defined but never used — stocks with DTC<3 or market cap >$10B are now correctly filtered.
+- **Scoring step discontinuity fix**: Replaced step-function scoring in `_score_short_intensity` with piecewise linear interpolation. Eliminates the 2-point cliff between 9.9% and 10.0% SI.
+- **NaN signals for missing data**: `days_to_cover` and `put_call_ratio` now emit `float("nan")` instead of `0` when data is unavailable, allowing downstream consumers to distinguish "not available" from "is zero".
+- **Finviz empty result logging**: Logs warning when Finviz returns empty results (possible rate limit) instead of silently falling back.
+- **Catalyst exception logging**: Earnings date parsing failures now logged at DEBUG level with traceback instead of bare `except: pass`.
+
+#### Blue Team — Meme-Stock Financial Quality, VIX Safety Valve
+- **Financial quality baseline**: Every stock starts with 5/25 baseline score. Meme stocks with poor financials now get 6-12/25 instead of 0/25. Slight revenue decline (-20% to 0%) gets 1pt instead of 0. This is a momentum screener, not a value screener.
+- **VIX regime multiplier**: `analyze()` now applies a global discount factor when VIX is elevated: VIX≥35 → 0.5x total score, VIX≥25 → 0.7x total score. This is the "safety valve" — it proportionally suppresses ALL factor scores in high-vol regimes, not just the market_regime factor.
+- **regime_multiplier in metadata**: Output now includes `regime_multiplier` for transparency.
+- **Earnings exception traceback**: DEBUG logging now includes `exc_info=True`.
+
+#### Green Team — MACD Integration, RVOL Price Direction Verification
+- **MACD in _score_technical_setup**: Docstring claimed "RSI, MA, BB, MACD" but code only had RSI, MA, BB. Now computes MACD from history and scores fresh bullish crossovers (within 3 days) at 4pts, ongoing bullish at 2pts.
+- **RVOL price direction check**: `_score_volume_explosion` now verifies that high RVOL accompanies a price *increase*. High RVOL on a >3% decline is discounted by 70% (distribution, not accumulation). Mild decline discounted by 40%.
+- **Scoring rebalance**: Sub-factor point allocations adjusted (RSI 7→6, MA 7→6, BB 6→5, VWAP 5→4) to accommodate MACD (0→4) within the 25pt ceiling.
+- **Signature change**: `_score_technical_setup` and `_score_volume_explosion` now take `hist` parameter.
+
+#### Yellow Team — Google Trends Circuit Breaker, Reddit Client Caching
+- **Google Trends circuit breaker**: After 3 consecutive failures, the GT circuit breaker opens and all subsequent calls return None immediately. Prevents cascade timeouts when Google rate-limits the scan. Resets on any successful cache hit or API response.
+- **Reddit client caching**: `praw.Reddit()` is now created once per scan run (lazy-init in `_get_reddit_client()`) and reused across all ticker analyses. Previously recreated the OAuth session for every ticker in `_get_reddit_sentiment()` and `_scan_reddit_for_tickers()`.
+- **Centralized Reddit client**: Both `_scan_reddit_for_tickers` and `_get_reddit_sentiment` now use `_get_reddit_client()`.
+
+#### Orange Team — OI-Weighted PCR, GEX Magnitude Normalization
+- **OI-weighted put/call ratio**: Added `put_call_ratio_oi` to `OptionsSnapshot` dataclass. Computed alongside volume-based PCR. OI-weighted PCR is more stable (less intraday noise) and now used in `_score_oi_setup`.
+- **GEX magnitude normalization**: `_score_gex` no longer uses binary sign (positive=12, negative=2). Now computes GEX imbalance ratio (`|net_gex| / total_gex`) and scores on a 3-tier scale: extreme (≥0.7 → 14pts), strong (≥0.4 → 11pts), mild (8pts). A tiny positive GEX is no longer scored the same as a massive one.
+- **GEX flip distance scoring**: Flip point proximity to spot now matters — within 5% of spot gets 4pts (high transition risk), further away gets 2pts.
+- **OI setup rebalance**: Sub-factor allocations adjusted for the new OI-weighted PCR (absolute OI 8→7, call dominance 7→6, new PCR_OI 0→5, vol/OI 5→4).
+
+#### Core Infrastructure
+- **OptionsSnapshot.put_call_ratio_oi**: New field in `src/core/data_types.py` for OI-weighted P/C ratio.
+
+---
+
 ## [0.3.0] - 2026-02-24
 
 ### Scoring Logic & Data Integrity Overhaul (P0 Fixes)
