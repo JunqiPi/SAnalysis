@@ -1,5 +1,76 @@
 # SAnalysis - Change Log
 
+## [0.5.0] - 2026-03-17
+
+### Claude AI Re-Scoring Integration + Post-Review Fixes
+
+**Implemented by**: SDE-Team (new feature + 5 review fixes)
+
+#### New Feature: AI Re-Scoring Module (`src/ai/`)
+- **`src/ai/client.py`**: Thread-safe singleton Anthropic SDK wrapper with double-checked locking, retry with exponential backoff, and graceful degradation (missing SDK, missing key, auth failure, rate limit, API errors all fall back to quant-only).
+- **`src/ai/prompts.py`**: 5 team-specific system prompts (red=squeeze analyst, orange=options microstructure, yellow=sentiment forensics, green=breakout specialist, blue=momentum/catalyst timing). JSON-only response format with valid flag enumerations.
+- **`src/ai/data_types.py`**: `AIRescoreResult` dataclass (ai_score, ai_confidence, ai_reasoning, ai_flags, blended_score).
+- **Score blending**: `blended = quant * (1 - ai_weight) + ai * ai_weight` (default ai_weight=0.3). Applied per-team post-scoring, pre-composite merge.
+- **Caching**: AI results cached via existing `cache_json`/`load_cached_json` with separate TTL (default 2h). Cache key uses sorted tickers to avoid order-dependent misses.
+- **CLI**: `--ai-rescore` flag. API key via `ANTHROPIC_API_KEY` env var or `config/secrets.yaml`.
+- **Config**: New `ai_rescore` section in `config/default.yaml` (enabled, model, max_tokens, temperature, ai_weight, batch_size, cache_ttl_hours, timeout_seconds, max_retries).
+- **Display**: `print_summary()` shows AI score, confidence, reasoning excerpt (truncated to 120 chars), and flags per team per ticker.
+- **Dependencies**: `anthropic>=0.39.0` as optional `[ai]` extra in `pyproject.toml`, included in `[all]`.
+- **Exception**: `AIRescoreError` added to `src/core/exceptions.py` hierarchy.
+
+#### Review Fix 1: `is_available()` Duplicate Warning Suppression
+- **Bug**: `is_available()` logged a WARNING on every call. Since it's called both in `PipelineOrchestrator.__init__()` (via `AIClient.instance().is_available()`) and in `rescore_batch()` (defensive check per team), the same warning was emitted 5+ times per run when the SDK or key was missing.
+- **Fix**: Added `_availability_warned` flag to `AIClient.__init__()`. Each warning branch now checks and sets this flag, logging only on the first invocation.
+
+#### Review Fix 2: `_call_api` RateLimitError Silent Exhaustion
+- **Bug**: The `RateLimitError` except block slept and retried but had no terminal error log. After exhausting all retries, the loop fell through to the bare `return None` at the bottom, producing no ERROR log (only WARNINGs per attempt). The `APIStatusError`/`APIConnectionError` block correctly logged an ERROR on the final attempt.
+- **Fix**: Added `if attempt >= max_retries: logger.error(...)` + `return None` at the top of the `RateLimitError` handler, matching the pattern used by the other API error handler.
+
+#### Review Fix 3: `_apply_ai_rescoring` Score Blending Vectorized
+- **Bug**: Score blending used a row-by-row `for i in range(len(df))` loop with `df.iloc[i, df.columns.get_loc(score_col)]` assignment. While technically correct for avoiding `SettingWithCopyWarning` (the df is the original, not a slice), this is O(n) with high per-iteration overhead from `iloc` + `get_loc` inside the loop. Also a pandas anti-pattern.
+- **Fix**: Replaced with vectorized `df.loc[has_ai, score_col] = ...` using a boolean mask `has_ai = pd.notna(df[ai_score_col])`. Single pandas operation, no loop.
+
+#### Review Fix 4: `ai_rescore.enabled` Config Field Dead Code
+- **Bug**: `config/default.yaml` defined `ai_rescore.enabled: false` with comment "Master switch (CLI --ai-rescore overrides)", but no code read this field. The only activation path was the `--ai-rescore` CLI flag. Users setting `enabled: true` in config would see no effect.
+- **Fix**: `PipelineOrchestrator.__init__()` now resolves AI enablement as `ai_rescore OR config.ai_rescore.enabled`. CLI flag remains the override; YAML provides the default.
+
+#### Review Fix 5: Unused Import + YAML Comment Header Cleanup
+- **Dead import**: Removed unused `from src.ai.data_types import AIRescoreResult` in `_apply_ai_rescoring()` (the method works with raw dicts, not the dataclass).
+- **YAML formatting**: Fixed duplicate comment header in `config/default.yaml` where the Orchestrator section header was merged with the AI Re-Scoring section header. Each section now has its own clean comment block.
+
+---
+
+## [0.4.1] - 2026-03-17
+
+### Infrastructure Hardening & Scoring Bugfix
+
+**Implemented by**: SDE-Team (5 targeted fixes)
+
+#### Fix 1: Configurable Network Timeouts
+- **New config key**: `general.network_timeout_seconds` (default 30s) in `config/default.yaml`.
+- **Finviz scraper**: `requests.get()` in `screen()` now reads timeout from config via `get_config().get_nested()` instead of hardcoded `timeout=15`. Falls back to module-level `_DEFAULT_TIMEOUT_SECONDS = 30` if config key is missing.
+- **yfinance limitation documented**: `market_data.py` module docstring now explains that yfinance manages its own internal `requests.Session` and does not expose a timeout parameter. The config key applies only to direct `requests` calls.
+
+#### Fix 2: Blue Team Negative D/E Scoring Bug
+- **Bug**: In `_score_financial_quality`, the D/E scoring chain started with `if de < 0.5: score += 5.0`. A negative D/E (e.g., -2.0) -- indicating negative shareholder equity / insolvency -- passed this condition, scoring 5 points as "very low debt".
+- **Fix**: Added explicit `if de < 0: pass` guard before the positive-value scoring chain. Insolvent companies now receive 0 additional D/E points instead of 5.
+
+#### Fix 3: Orchestrator Team Weights Moved to Config
+- **New config section**: `orchestrator.team_weights` in `config/default.yaml` with the same values previously hardcoded in `orchestrator.py` (`red: 1.0, orange: 1.0, yellow: 0.8, green: 1.0, blue: 0.9`).
+- **Code change**: `PipelineOrchestrator.__init__()` now reads weights with 3-tier priority: explicit `team_weights` constructor arg > `orchestrator.team_weights` from config YAML > `_FALLBACK_TEAM_WEIGHTS` hardcoded constant.
+- **Backward compatible**: Renamed module constant from `DEFAULT_TEAM_WEIGHTS` to `_FALLBACK_TEAM_WEIGHTS` (private). Callers passing explicit `team_weights=` are unaffected.
+
+#### Fix 4: YAML Parsing Error Handling in Config
+- **Bug**: `yaml.safe_load()` calls in `Config._load()` were not wrapped in try/except. A malformed YAML file would raise an opaque `yaml.YAMLError` with no indication of which file failed.
+- **Fix**: Both `default.yaml` and `secrets.yaml` parsing are now wrapped in `try/except yaml.YAMLError`. On failure: logs an ERROR with the exact file path and error details, then raises `ConfigError` (from `src/core/exceptions.py`) with a descriptive message, chaining the original exception via `from exc`.
+- **New import**: `config.py` now imports `ConfigError` from `src.core.exceptions`.
+
+#### Fix 5: Yellow Team `_score_momentum` TypeError on None Mentions
+- **Bug**: In `_score_momentum`, `aw_data.get("mentions_24h_ago", 0)` used a default of `0`, but when the key exists with an explicit `None` value, `dict.get()` returns `None` (the default only applies for missing keys). The subsequent comparison `None > 0` at line 584 raised `TypeError: '>' not supported between instances of 'NoneType' and 'int'`. The same latent issue affected `"mentions"` and the `current > 0` branch.
+- **Fix**: Changed both lines to use `or 0` coalescion: `aw_data.get("mentions") or 0` and `aw_data.get("mentions_24h_ago") or 0`. This handles both missing-key and explicit-`None` cases, coalescing to `0` in either scenario.
+
+---
+
 ## [0.4.0] - 2026-02-24
 
 ### P1 Scoring Refinement & Robustness Improvements

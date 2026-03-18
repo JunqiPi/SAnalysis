@@ -43,8 +43,9 @@ def _create_screener(qualified_name: str) -> BaseScreener:
     cls = getattr(module, class_name)
     return cls()
 
-# Team weights for composite scoring (adjustable via strategy)
-DEFAULT_TEAM_WEIGHTS = {
+# Fallback team weights used when config/default.yaml does not define
+# orchestrator.team_weights (or a caller does not supply explicit overrides).
+_FALLBACK_TEAM_WEIGHTS: dict[str, float] = {
     "red": 1.0,
     "orange": 1.0,
     "yellow": 0.8,     # Sentiment is noisier, slightly lower weight
@@ -129,14 +130,44 @@ class PipelineOrchestrator:
         self,
         teams: Sequence[str] | None = None,
         team_weights: dict[str, float] | None = None,
+        ai_rescore: bool = False,
     ) -> None:
         """
         Args:
             teams: Which teams to run. None = all. E.g. ["red", "green"].
             team_weights: Override team weights for composite scoring.
+            ai_rescore: Enable Claude AI qualitative re-scoring.
         """
         self.cfg = get_config()
-        self.team_weights = team_weights or DEFAULT_TEAM_WEIGHTS
+        self._ai_client = None
+
+        # Resolve AI re-scoring: CLI flag overrides YAML config default
+        ai_enabled = ai_rescore or bool(
+            self.cfg.get_nested("ai_rescore", "enabled", default=False)
+        )
+        if ai_enabled:
+            try:
+                from src.ai.client import AIClient
+                client = AIClient.instance()
+                if client.is_available():
+                    self._ai_client = client
+                    logger.info("AI re-scoring enabled.")
+                else:
+                    logger.warning("AI re-scoring requested but not available. Using quant-only.")
+            except Exception:
+                logger.exception("Failed to initialize AI client. Using quant-only.")
+
+        # Priority: explicit arg > config YAML > hardcoded fallback
+        if team_weights is not None:
+            self.team_weights = team_weights
+        else:
+            cfg_weights = self.cfg.get_nested("orchestrator", "team_weights")
+            if isinstance(cfg_weights, dict) and cfg_weights:
+                self.team_weights = {
+                    k: float(v) for k, v in cfg_weights.items()
+                }
+            else:
+                self.team_weights = _FALLBACK_TEAM_WEIGHTS
 
         # Only instantiate requested teams (lazy import for faster startup)
         requested = teams or list(_SCREENER_REGISTRY.keys())
@@ -203,6 +234,10 @@ class PipelineOrchestrator:
         # Build per-team DataFrames
         team_dfs = self._build_team_dataframes(all_results)
 
+        # AI re-scoring (only when enabled + client available)
+        if self._ai_client is not None:
+            team_dfs = self._apply_ai_rescoring(team_dfs, all_results)
+
         # Merge into unified watchlist with composite scoring
         watchlist = self._merge_and_score(team_dfs)
         return watchlist
@@ -244,6 +279,130 @@ class PipelineOrchestrator:
                 df.rename(columns=rename_map, inplace=True)
                 df.rename(columns={"score": f"{team}_score"}, inplace=True)
                 team_dfs[team] = df
+
+        return team_dfs
+
+    def _apply_ai_rescoring(
+        self,
+        team_dfs: dict[str, pd.DataFrame],
+        all_results: list[ScreenResult],
+    ) -> dict[str, pd.DataFrame]:
+        """Apply Claude AI re-scoring to each team's results.
+
+        For each team, builds ticker data from ScreenResults, checks cache,
+        calls the AI client, and blends scores into the team DataFrame.
+        """
+        from src.core.cache import cache_json, load_cached_json
+
+        ai_weight = self.cfg.get_nested("ai_rescore", "ai_weight", default=0.3)
+        cache_ttl_h = self.cfg.get_nested("ai_rescore", "cache_ttl_hours", default=2)
+        cache_ttl_s = float(cache_ttl_h) * 3600
+        batch_size = self.cfg.get_nested("ai_rescore", "batch_size", default=20)
+
+        # Group ScreenResults by team
+        by_team: dict[str, list[ScreenResult]] = {}
+        for r in all_results:
+            by_team.setdefault(r.team, []).append(r)
+
+        for team, df in team_dfs.items():
+            team_results = by_team.get(team, [])
+            if not team_results or "ticker" not in df.columns:
+                continue
+
+            # Build ticker_data dicts for the AI
+            ticker_data = []
+            for sr in team_results:
+                ticker_data.append({
+                    "ticker": sr.ticker,
+                    "quant_score": sr.score,
+                    "signals": sr.signals,
+                    "metadata": {
+                        k: v for k, v in sr.metadata.items()
+                        if isinstance(v, (int, float, str, bool))
+                    },
+                })
+
+            # Check cache (key = sorted tickers + team)
+            tickers_key = ",".join(sorted(td["ticker"] for td in ticker_data))
+            cache_key = f"{team}_{tickers_key}"
+            cached = load_cached_json("ai_rescore", cache_key, ttl_seconds=cache_ttl_s)
+
+            if cached is not None:
+                logger.info("AI re-score cache hit for team [%s].", team)
+                ai_results_raw = cached
+            else:
+                logger.info("Calling AI re-scoring for team [%s] (%d tickers)...", team, len(ticker_data))
+                # Batch if needed
+                all_ai: list[dict] = []
+                for i in range(0, len(ticker_data), batch_size):
+                    batch = ticker_data[i:i + batch_size]
+                    results = self._ai_client.rescore_batch(team, batch)
+                    for r in results:
+                        all_ai.append({
+                            "ticker": r.ticker,
+                            "ai_score": r.ai_score,
+                            "ai_confidence": r.ai_confidence,
+                            "ai_reasoning": r.ai_reasoning,
+                            "ai_flags": r.ai_flags,
+                            "quant_score": r.quant_score,
+                            "blended_score": r.blended_score,
+                        })
+
+                ai_results_raw = all_ai
+                # Cache the results
+                if ai_results_raw:
+                    cache_json("ai_rescore", cache_key, ai_results_raw)
+
+            if not ai_results_raw:
+                logger.warning("No AI results for team [%s], using quant-only.", team)
+                continue
+
+            # Build lookup by ticker
+            ai_lookup: dict[str, dict] = {r["ticker"]: r for r in ai_results_raw}
+
+            # Add AI columns to the team DataFrame
+            score_col = f"{team}_score"
+            ai_score_col = f"{team}_ai_score"
+            ai_conf_col = f"{team}_ai_confidence"
+            ai_reason_col = f"{team}_ai_reasoning"
+            ai_flags_col = f"{team}_ai_flags"
+
+            ai_scores = []
+            ai_confs = []
+            ai_reasons = []
+            ai_flags = []
+
+            for _, row in df.iterrows():
+                ticker = row.get("ticker", "")
+                ai_data = ai_lookup.get(ticker)
+                if ai_data:
+                    ai_scores.append(ai_data["ai_score"])
+                    ai_confs.append(ai_data["ai_confidence"])
+                    ai_reasons.append(ai_data["ai_reasoning"])
+                    ai_flags.append(", ".join(ai_data.get("ai_flags", [])))
+                else:
+                    ai_scores.append(float("nan"))
+                    ai_confs.append("")
+                    ai_reasons.append("")
+                    ai_flags.append("")
+
+            df[ai_score_col] = ai_scores
+            df[ai_conf_col] = ai_confs
+            df[ai_reason_col] = ai_reasons
+            df[ai_flags_col] = ai_flags
+
+            # Blend scores where AI is available (vectorized)
+            if score_col in df.columns:
+                has_ai = pd.notna(df[ai_score_col])
+                df.loc[has_ai, score_col] = (
+                    df.loc[has_ai, score_col] * (1 - ai_weight)
+                    + df.loc[has_ai, ai_score_col] * ai_weight
+                )
+
+            logger.info(
+                "AI re-scoring applied for team [%s]: %d/%d tickers scored.",
+                team, sum(1 for s in ai_scores if not pd.isna(s)), len(df),
+            )
 
         return team_dfs
 
@@ -399,6 +558,29 @@ class PipelineOrchestrator:
                         )
                         connector = "\u2514\u2500" if i == len(factors) - 1 else "\u251C\u2500"
                         lines.append(f"     {connector} {cn_name}:{val:>10.1f}/25")
+
+                    # AI re-score detail (if available)
+                    ai_score_col = f"{team}_ai_score"
+                    ai_conf_col = f"{team}_ai_confidence"
+                    ai_reason_col = f"{team}_ai_reasoning"
+                    ai_flags_col = f"{team}_ai_flags"
+                    if ai_score_col in watchlist.columns:
+                        ai_val = row.get(ai_score_col)
+                        if pd.notna(ai_val):
+                            ai_s = self._safe_float(ai_val)
+                            ai_c = row.get(ai_conf_col, "")
+                            ai_r = row.get(ai_reason_col, "")
+                            ai_f = row.get(ai_flags_col, "")
+                            lines.append(
+                                f"     \U0001F916 AI\u8bc4\u5206: {ai_s:.1f}/100 "
+                                f"(\u4fe1\u5fc3: {ai_c})"
+                            )
+                            if ai_r:
+                                # Truncate long reasoning for display
+                                display_reason = ai_r[:120] + "..." if len(ai_r) > 120 else ai_r
+                                lines.append(f"        {display_reason}")
+                            if ai_f:
+                                lines.append(f"        \u6807\u8bb0: {ai_f}")
 
             # Composite breakdown -- only include active teams with score columns
             lines.append("")

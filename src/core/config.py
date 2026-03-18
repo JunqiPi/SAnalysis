@@ -18,6 +18,8 @@ from typing import Any
 
 import yaml
 
+from src.core.exceptions import ConfigError
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +50,7 @@ def _apply_env_overrides(cfg: dict) -> dict:
         "REDDIT_USER_AGENT": ("api_keys", "reddit_user_agent"),
         "FINNHUB_API_KEY": ("api_keys", "finnhub_api_key"),
         "ALPHA_VANTAGE_KEY": ("api_keys", "alpha_vantage_key"),
+        "ANTHROPIC_API_KEY": ("api_keys", "anthropic_api_key"),
     }
     for env_var, path in env_map.items():
         value = os.environ.get(env_var)
@@ -132,12 +135,24 @@ class Config:
                 f"Ensure config/default.yaml exists in the project root."
             )
 
-        with open(default_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        try:
+            with open(default_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            logger.error("Failed to parse YAML config file '%s': %s", default_path, exc)
+            raise ConfigError(
+                f"Failed to parse configuration file '{default_path}': {exc}"
+            ) from exc
 
         if secrets_path.exists():
-            with open(secrets_path, "r", encoding="utf-8") as f:
-                secrets = yaml.safe_load(f) or {}
+            try:
+                with open(secrets_path, "r", encoding="utf-8") as f:
+                    secrets = yaml.safe_load(f) or {}
+            except yaml.YAMLError as exc:
+                logger.error("Failed to parse YAML secrets file '%s': %s", secrets_path, exc)
+                raise ConfigError(
+                    f"Failed to parse secrets file '{secrets_path}': {exc}"
+                ) from exc
             cfg = _deep_merge(cfg, secrets)
             logger.debug("Merged secrets.yaml into configuration.")
 

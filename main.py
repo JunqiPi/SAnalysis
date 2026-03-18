@@ -36,7 +36,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from src.pipeline.orchestrator import PipelineOrchestrator
 
@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         help="Clear all cached data before running",
     )
     parser.add_argument(
+        "--ai-rescore",
+        action="store_true",
+        help="Enable Claude AI qualitative re-scoring (requires ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -120,7 +125,7 @@ def main() -> int:
 
     t0 = time.monotonic()
 
-    orchestrator = PipelineOrchestrator(teams=args.teams)
+    orchestrator = PipelineOrchestrator(teams=args.teams, ai_rescore=args.ai_rescore)
     watchlist = orchestrator.run(
         tickers=args.tickers,
         parallel=not args.no_parallel,

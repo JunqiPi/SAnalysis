@@ -275,10 +275,14 @@ class MomentumCatalystScreener(BaseScreener):
                 score += 1.0  # Slight decline, not catastrophic
 
         # Debt profile (0-5 additional)
+        # Negative D/E means negative shareholder equity (insolvency),
+        # NOT low debt. Score 0 additional points for insolvent companies.
         max_de = cfg.get("max_debt_to_equity", 3.0)
         if snap.debt_to_equity is not None:
             de = snap.debt_to_equity
-            if de < 0.5:
+            if de < 0:
+                pass  # Insolvent: negative equity, 0 additional points
+            elif de < 0.5:
                 score += 5.0  # Very low debt
             elif de < 1.0:
                 score += 4.0

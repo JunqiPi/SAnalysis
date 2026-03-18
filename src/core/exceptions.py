@@ -32,3 +32,7 @@ class TickerValidationError(SAnalysisError, ValueError):
     Also inherits from ValueError for backward compatibility with code
     that catches ValueError for input validation errors.
     """
+
+
+class AIRescoreError(SAnalysisError):
+    """Error during AI re-scoring (API call, parse, or SDK issue)."""

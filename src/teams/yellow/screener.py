@@ -579,8 +579,8 @@ class SocialSentimentScreener(BaseScreener):
         # (available from ApeWisdom data cached by _fetch_apewisdom)
         aw_data = self._get_apewisdom_ticker(snap.ticker)
         if aw_data is not None:
-            current = aw_data.get("mentions", 0)
-            prev = aw_data.get("mentions_24h_ago", 0)
+            current = aw_data.get("mentions") or 0
+            prev = aw_data.get("mentions_24h_ago") or 0
             if prev > 0:
                 acceleration = (current - prev) / prev
                 if acceleration >= 2.0:

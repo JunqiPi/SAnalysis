@@ -126,8 +126,17 @@ def cache_json(namespace: str, key: str, data: Any) -> None:
     _atomic_write(path, payload)
 
 
-def load_cached_json(namespace: str, key: str) -> Any | None:
-    """Load a JSON object from cache if fresh."""
+def load_cached_json(
+    namespace: str,
+    key: str,
+    ttl_seconds: float | None = None,
+) -> Any | None:
+    """Load a JSON object from cache if fresh.
+
+    Args:
+        ttl_seconds: Override global TTL for this lookup. When None,
+                     the global ``cache_ttl_hours`` setting is used.
+    """
     h = _key_hash(namespace, key)
     path = _cache_dir() / f"{namespace}_{h}.json"
 
@@ -142,7 +151,8 @@ def load_cached_json(namespace: str, key: str) -> Any | None:
         return None
 
     age = time.time() - payload.get("ts", 0)
-    if age > _ttl_seconds():
+    ttl = ttl_seconds if ttl_seconds is not None else _ttl_seconds()
+    if age > ttl:
         return None
 
     return payload.get("data")

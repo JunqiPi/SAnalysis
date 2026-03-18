@@ -18,7 +18,11 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from src.core.config import get_config
+
 logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_SECONDS = 30
 
 _BASE_URL = "https://finviz.com/screener.ashx"
 _HEADERS = {
@@ -149,7 +153,11 @@ def screen(filters: list[str], max_pages: int = 3) -> pd.DataFrame:
             "r": str(start),
         }
         try:
-            resp = requests.get(_BASE_URL, params=params, headers=_HEADERS, timeout=15)
+            timeout = get_config().get_nested(
+                "general", "network_timeout_seconds",
+                default=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            resp = requests.get(_BASE_URL, params=params, headers=_HEADERS, timeout=timeout)
             resp.raise_for_status()
         except requests.RequestException:
             logger.exception("Finviz request failed (page %d)", page_idx + 1)

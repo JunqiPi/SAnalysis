@@ -6,6 +6,15 @@ All teams route through this module so we get:
   - Consistent error handling
   - Single point to swap data providers in future phases
   - Ticker object reuse to minimize redundant Yahoo Finance sessions
+
+NOTE on network timeouts:
+  yfinance manages its own internal ``requests.Session`` and does not
+  expose a ``timeout`` parameter on public methods (`.history()`,
+  `.info`, `.option_chain()`, etc.).  The ``general.network_timeout_seconds``
+  config key is therefore enforced only in modules that make direct
+  ``requests`` calls (e.g., ``finviz_scraper``).  If yfinance hangs,
+  the ThreadPoolExecutor in the orchestrator will still bound wall-clock
+  time per team via OS-level socket timeouts (typically 60-120 s).
 """
 
 from __future__ import annotations

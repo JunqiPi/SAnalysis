@@ -1,6 +1,6 @@
 [project]
 name = "sanalysis"
-version = "0.4.0"
+version = "0.5.0"
 description = "Meme Stock Analysis Platform - Five-Team Data Infrastructure"
 requires-python = ">=3.10"
 dependencies = [
@@ -38,8 +38,11 @@ dev = [
 dashboard = [
     "streamlit>=1.30.0",
 ]
+ai = [
+    "anthropic>=0.39.0",
+]
 all = [
-    "sanalysis[reddit,dev,dashboard]",
+    "sanalysis[reddit,dev,dashboard,ai]",
 ]
 
 [project.scripts]
@@ -47,7 +50,7 @@ sanalysis = "main:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]

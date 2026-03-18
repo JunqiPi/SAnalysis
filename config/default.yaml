@@ -9,6 +9,7 @@ general:
   cache_ttl_hours: 4          # How long cached data stays valid
   max_workers: 4              # Concurrent data fetch threads
   log_level: "INFO"
+  network_timeout_seconds: 30 # Timeout for outbound HTTP requests (Finviz, etc.)
 
 # -----------------------------------------------------------
 # API Credentials (override via config/secrets.yaml or env vars)
@@ -17,6 +18,7 @@ api_keys:
   reddit_client_id: ""
   reddit_client_secret: ""
   reddit_user_agent: "SAnalysis/0.1 by MemeStockTeam"
+  anthropic_api_key: ""
   # Future Phase 2+ keys:
   # finnhub_api_key: ""
   # alpha_vantage_key: ""
@@ -143,3 +145,28 @@ blue_team:
   # Financial quality filters
   min_revenue_growth_pct: 10.0    # YoY revenue growth
   max_debt_to_equity: 3.0         # Leverage cap
+
+# -----------------------------------------------------------
+# AI Re-Scoring (opt-in via --ai-rescore CLI flag)
+# -----------------------------------------------------------
+ai_rescore:
+  enabled: false                  # Master switch (CLI --ai-rescore overrides)
+  model: "claude-opus-4-6"
+  max_tokens: 4096
+  temperature: 0.3
+  ai_weight: 0.3                  # Blend: quant*(1-w) + ai*w
+  batch_size: 20                  # Max tickers per API call
+  cache_ttl_hours: 2              # AI results cache (shorter than market data)
+  timeout_seconds: 60
+  max_retries: 3
+
+# -----------------------------------------------------------
+# Orchestrator: Composite Scoring Weights
+# -----------------------------------------------------------
+orchestrator:
+  team_weights:
+    red: 1.0
+    orange: 1.0
+    yellow: 0.8       # Sentiment is noisier, slightly lower weight
+    green: 1.0
+    blue: 0.9
