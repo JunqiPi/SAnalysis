@@ -6,6 +6,12 @@ the HTML table. Respects rate limits with delays between requests.
 
 NOTE: Finviz free tier has 15-minute delayed data. This is acceptable
 for Phase 1 paper-trading validation.
+
+IMPORTANT: Finviz free tier ignores the ``o=`` (order_by) URL parameter,
+always returning results in alphabetical ticker order.  To ensure the
+most relevant candidates appear first (not just A-C tickers), each
+convenience function selects a Finviz *view* that contains the target
+sort column and applies **client-side sorting** after fetching.
 """
 
 from __future__ import annotations
@@ -18,9 +24,31 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from src.core.cache import cache_json, load_cached_json
 from src.core.config import get_config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Finviz view IDs — each view exposes a different column set.
+# Choosing the right view is critical for client-side sorting because
+# you can only sort by columns that are actually present in the response.
+# ---------------------------------------------------------------------------
+VIEW_OVERVIEW = "111"      # Ticker, Company, Sector, Industry, Country, Market Cap, P/E, Price, Change, Volume
+VIEW_OWNERSHIP = "131"     # Market Cap, Outstanding, Float, Insider Own, Inst Own, Short Float, Short Ratio, ...
+VIEW_PERFORMANCE = "141"   # Perf Week..10Y, Volatility W/M, Avg Volume, Rel Volume, Price, Change, Volume
+VIEW_CUSTOM = "152"        # Valuation + short float columns (legacy default)
+VIEW_FINANCIAL = "161"     # Market Cap, ROA, ROE, ROIC, Debt/Eq, Margins, Earnings, ...
+
+# Finviz sort column identifiers for the ``o=`` URL parameter.
+# Retained for forward-compatibility (Elite/Pro tiers support server-side sorting).
+# Prefix with ``-`` for descending order; ascending is the default.
+ORDER_SHORT_FLOAT_DESC = "-shortfloat"  # Highest short float first
+ORDER_RVOL_DESC = "-relativevolume"     # Highest relative volume first
+ORDER_MARKET_CAP_ASC = "marketcap"      # Smallest market cap first
+ORDER_FLOAT_ASC = "float"              # Smallest float first
+ORDER_CHANGE_DESC = "-change"           # Biggest movers first
+ORDER_VOLUME_DESC = "-volume"           # Highest volume first
 
 _DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -72,9 +100,6 @@ FILTER_MAP = {
     "rsi_oversold30": "ta_rsi_os30",
     "rsi_overbought70": "ta_rsi_ob70",
 }
-
-# Column view mode: custom columns that include short float
-_CUSTOM_VIEW = "152"  # Valuation + short float columns
 
 
 def _parse_screener_table(html: str) -> pd.DataFrame:
@@ -132,26 +157,91 @@ def _clean_numeric(series: pd.Series) -> pd.Series:
     return series.apply(_parse)
 
 
-def screen(filters: list[str], max_pages: int = 3) -> pd.DataFrame:
+def sort_dataframe(
+    df: pd.DataFrame,
+    sort_column: str,
+    ascending: bool = True,
+) -> pd.DataFrame:
+    """Sort a Finviz DataFrame by a numeric column (client-side).
+
+    Parses the column with ``_clean_numeric()``, sorts, then drops
+    the temporary sort key.  Rows where the sort column is missing
+    or unparseable are pushed to the bottom.
+
+    Args:
+        df: Finviz screener DataFrame.
+        sort_column: Column name to sort by (must exist in *df*).
+        ascending: Sort direction; False = highest first.
+
+    Returns:
+        Sorted DataFrame (new object, original unchanged).
+    """
+    if df.empty or sort_column not in df.columns:
+        return df
+
+    sorted_df = df.copy()
+    sort_key = f"_sort_{sort_column}"
+    sorted_df[sort_key] = _clean_numeric(sorted_df[sort_column])
+    sorted_df.sort_values(
+        sort_key, ascending=ascending, na_position="last", inplace=True,
+    )
+    sorted_df.drop(columns=[sort_key], inplace=True)
+    sorted_df.reset_index(drop=True, inplace=True)
+    return sorted_df
+
+
+def screen(
+    filters: list[str],
+    max_pages: int = 10,
+    order_by: str | None = None,
+    view: str = VIEW_CUSTOM,
+) -> pd.DataFrame:
     """Run a Finviz screener with the given filter codes.
 
     Args:
         filters: List of Finviz filter codes (e.g. ['sh_short_o10', 'sh_avgvol_o200']).
         max_pages: Maximum result pages to fetch (20 results per page).
+            Default 10 (200 results).  First run takes ~15s (1.5s polite
+            delay per page) but results are cached for 1 hour.
+        order_by: Finviz sort column for the ``o=`` URL parameter.
+            Prefix with ``-`` for descending.  **NOTE**: This is ignored
+            by the Finviz free tier; the convenience functions apply
+            client-side sorting instead.  Retained for forward-compatibility
+            with Elite/Pro tiers.
+        view: Finviz view ID controlling which columns are returned.
+            Use the ``VIEW_*`` constants.  Different views expose different
+            columns — choose the view that contains the column you need
+            for client-side sorting.
 
     Returns:
         DataFrame with screener results. Columns vary by view mode.
     """
+    filter_str = ",".join(sorted(filters))
+    cache_key = f"{filter_str}|{order_by or ''}|v{view}|p{max_pages}"
+
+    # Check cache first (Finviz free tier is 15-min delayed; 1-hour cache
+    # avoids redundant HTTP calls on repeated runs).
+    cached = load_cached_json("finviz_screen", cache_key, ttl_seconds=3600)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        logger.debug(
+            "Finviz screen cache hit (%d rows): filters=%s order=%s view=%s",
+            len(df), filter_str, order_by, view,
+        )
+        return df
+
     all_dfs: list[pd.DataFrame] = []
-    filter_str = ",".join(filters)
 
     for page_idx in range(max_pages):
         start = page_idx * 20 + 1
         params: dict[str, Any] = {
-            "v": _CUSTOM_VIEW,
+            "v": view,
             "f": filter_str,
             "r": str(start),
         }
+        if order_by:
+            params["o"] = order_by
+
         try:
             timeout = get_config().get_nested(
                 "general", "network_timeout_seconds",
@@ -182,6 +272,13 @@ def screen(filters: list[str], max_pages: int = 3) -> pd.DataFrame:
     # Deduplicate by ticker
     ticker_col = "Ticker" if "Ticker" in combined.columns else combined.columns[1]
     combined.drop_duplicates(subset=[ticker_col], keep="first", inplace=True)
+
+    # Cache the results (store as list-of-dicts for JSON serialization)
+    try:
+        cache_json("finviz_screen", cache_key, combined.to_dict(orient="records"))
+    except Exception:
+        logger.debug("Failed to cache Finviz screen results.", exc_info=True)
+
     return combined
 
 
@@ -192,10 +289,12 @@ def get_short_squeeze_candidates(
 ) -> pd.DataFrame:
     """Convenience: fetch stocks with high short float for Red Team.
 
+    Uses Finviz view 131 (Ownership) which exposes "Short Float" and
+    "Short Ratio" columns, then sorts client-side by short float
+    descending so the most heavily shorted stocks appear first.
+
     Returns a DataFrame with ticker, short float %, float shares, etc.
     """
-    filter_codes = []
-
     # Map friendly names to filter codes
     sf_map = {
         "over5": "sh_short_o5",
@@ -215,11 +314,19 @@ def get_short_squeeze_candidates(
         "over5": "sh_price_o5",
     }
 
-    filter_codes.append(sf_map.get(min_short_float, "sh_short_o10"))
-    filter_codes.append(vol_map.get(min_avg_volume, "sh_avgvol_o200"))
-    filter_codes.append(price_map.get(min_price, "sh_price_o1"))
+    filter_codes = [
+        sf_map.get(min_short_float, "sh_short_o10"),
+        vol_map.get(min_avg_volume, "sh_avgvol_o200"),
+        price_map.get(min_price, "sh_price_o1"),
+    ]
 
-    return screen(filter_codes)
+    df = screen(
+        filter_codes,
+        order_by=ORDER_SHORT_FLOAT_DESC,
+        view=VIEW_OWNERSHIP,
+    )
+    # Client-side sort: highest short float first
+    return sort_dataframe(df, "Short Float", ascending=False)
 
 
 def get_low_float_candidates(
@@ -227,7 +334,12 @@ def get_low_float_candidates(
     min_rvol: str = "over2",
     min_price: str = "over1",
 ) -> pd.DataFrame:
-    """Convenience: fetch low-float high-RVOL stocks for Green Team."""
+    """Convenience: fetch low-float high-RVOL stocks for Green Team.
+
+    Uses Finviz view 141 (Performance) which exposes "Rel Volume",
+    then sorts client-side by relative volume descending so the
+    most actively traded low-float stocks appear first.
+    """
     float_map = {
         "under10m": "sh_float_u10",
         "under20m": "sh_float_u20",
@@ -249,7 +361,14 @@ def get_low_float_candidates(
         rvol_map.get(min_rvol, "sh_relvol_o2"),
         price_map.get(min_price, "sh_price_o1"),
     ]
-    return screen(codes)
+
+    df = screen(
+        codes,
+        order_by=ORDER_RVOL_DESC,
+        view=VIEW_PERFORMANCE,
+    )
+    # Client-side sort: highest relative volume first
+    return sort_dataframe(df, "Rel Volume", ascending=False)
 
 
 def get_small_cap_momentum_candidates(
@@ -259,6 +378,10 @@ def get_small_cap_momentum_candidates(
     min_avg_volume: str = "over200k",
 ) -> pd.DataFrame:
     """Convenience: fetch small-cap stocks with momentum signals for Blue Team.
+
+    Uses Finviz view 141 (Performance) which exposes "Rel Volume",
+    then sorts client-side by relative volume descending to surface
+    stocks with unusual activity.
 
     Targets stocks under $2B market cap with elevated relative volume,
     indicating potential momentum setups.
@@ -289,4 +412,11 @@ def get_small_cap_momentum_candidates(
         vol_map.get(min_avg_volume, "sh_avgvol_o200"),
         price_map.get(min_price, "sh_price_o1"),
     ]
-    return screen(codes)
+
+    df = screen(
+        codes,
+        order_by=ORDER_RVOL_DESC,
+        view=VIEW_PERFORMANCE,
+    )
+    # Client-side sort: highest relative volume first
+    return sort_dataframe(df, "Rel Volume", ascending=False)

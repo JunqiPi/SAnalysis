@@ -151,3 +151,10 @@ Optional: praw (Reddit API — needs keys in secrets.yaml), anthropic (AI re-sco
   - **P0**: `main.py` — Purple team blocked from CLI (missing argparse choice), stale version "0.5.0"→"1.0.0", stale "Five-Team"→"Six-Team" description.
   - **P1**: Red team missing `market_cap_millions` in metadata (broke global market cap gate for Red-only tickers), Yellow fallback list had TSLA/NVDA (wasted API calls before $3B gate), `cache.py` redundant `mkdir` syscalls on every cache op (now lazy singleton).
   - **P2**: Red inlined `shortPercentOfFloat` extraction (eliminated redundant cache read), Purple `market_cap_millions` moved from signals→metadata, Green `_build_snapshot_from_hist` accepts pre-fetched `info`, `technical.py` dead variable removed, `base.py` docstring "five"→"six", `cache.py` simplified redundant exception hierarchy.
+- **2026-03-18 v1.0.2**: Finviz alphabetical sampling bias fix — root cause of "same stocks every run".
+  - **Root cause**: Finviz free tier ignores `o=` sort parameter, always returning results in alphabetical order. With `max_pages=3` (60 results), only A-C tickers ever appeared.
+  - **Fix**: `screen()` now accepts `view` parameter (different views expose different columns). Each convenience function selects the Finviz view containing its sort column, then applies **client-side sorting** via new `sort_dataframe()` utility. `max_pages` increased 5→10 (200 results, ~15s first fetch, cached 1 hour).
+  - **Per-team view & sort**: Red→VIEW_OWNERSHIP (sort by "Short Float" desc), Green/Blue→VIEW_PERFORMANCE (sort by "Rel Volume" desc), Purple→VIEW_OVERVIEW (sort by "Market Cap" asc).
+  - **New API**: `VIEW_OVERVIEW`, `VIEW_OWNERSHIP`, `VIEW_PERFORMANCE`, `VIEW_FINANCIAL`, `VIEW_CUSTOM` constants. `sort_dataframe(df, column, ascending)` public utility.
+  - **Finviz result caching**: 1-hour TTL, cache key includes view + order_by + max_pages for correctness.
+  - **Files changed**: `src/utils/finviz_scraper.py`, `src/teams/purple/screener.py`.

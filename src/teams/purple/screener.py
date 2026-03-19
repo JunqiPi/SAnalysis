@@ -116,11 +116,17 @@ class TenBaggerScreener(BaseScreener):
         of historically volatile micro/small-cap stocks.
         """
         try:
-            df = finviz_scraper.screen([
-                "cap_smallunder",
-                "sh_avgvol_o200",
-                "sh_price_o1",
-            ])
+            df = finviz_scraper.screen(
+                [
+                    "cap_smallunder",
+                    "sh_avgvol_o200",
+                    "sh_price_o1",
+                ],
+                order_by=finviz_scraper.ORDER_MARKET_CAP_ASC,
+                view=finviz_scraper.VIEW_OVERVIEW,
+            )
+            # Client-side sort: smallest market cap first (10x potential)
+            df = finviz_scraper.sort_dataframe(df, "Market Cap", ascending=True)
             if not df.empty:
                 ticker_col = "Ticker" if "Ticker" in df.columns else df.columns[1]
                 tickers = df[ticker_col].tolist()

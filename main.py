@@ -36,7 +36,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 from src.pipeline.orchestrator import PipelineOrchestrator
 

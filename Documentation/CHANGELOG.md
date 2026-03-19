@@ -1,5 +1,58 @@
 # SAnalysis - Change Log
 
+## [1.0.2] - 2026-03-18
+
+### Finviz Alphabetical Sampling Bias Fix
+
+**Implemented by**: SDE-Team (2 files modified)
+
+**Motivation**: Users reported that running the pipeline multiple times always produced the same stock candidates. Root cause analysis revealed that Finviz free tier ignores the `o=` (order_by) URL parameter, always returning results in alphabetical ticker order. With the previous `max_pages=3` (60 results), only tickers in the A-C alphabetical range would ever appear, regardless of their actual metric values.
+
+#### Root Cause
+
+The Finviz screener HTML endpoint (`screener.ashx`) supports an `o=` parameter for server-side sorting (e.g., `o=-shortfloat` for highest short float first). However, this feature is **gated behind Finviz Elite/Pro subscriptions**. On the free tier, all results are returned in alphabetical order by ticker, making the `o=` parameter a no-op. Combined with a low `max_pages` limit, the pipeline always analyzed the same alphabetically-first tickers.
+
+#### Fix: View-Specific Fetching + Client-Side Sorting
+
+1. **`screen()` now accepts a `view` parameter**: Different Finviz views expose different column sets. The correct view must be selected to get the column needed for sorting.
+
+   | View Constant | ID | Key Columns |
+   |--------------|-----|-------------|
+   | `VIEW_OVERVIEW` | 111 | Company, Sector, Market Cap, P/E |
+   | `VIEW_OWNERSHIP` | 131 | Float, Short Float, Short Ratio, Insider Own |
+   | `VIEW_PERFORMANCE` | 141 | Perf Week..10Y, Rel Volume, Volatility |
+   | `VIEW_CUSTOM` | 152 | Legacy default (Valuation) |
+   | `VIEW_FINANCIAL` | 161 | ROA, ROE, ROIC, Debt/Eq, Margins |
+
+2. **Each convenience function selects the right view and applies client-side sorting**:
+
+   | Function | View | Sort Column | Direction |
+   |----------|------|-------------|-----------|
+   | `get_short_squeeze_candidates()` | VIEW_OWNERSHIP (131) | Short Float | Descending |
+   | `get_low_float_candidates()` | VIEW_PERFORMANCE (141) | Rel Volume | Descending |
+   | `get_small_cap_momentum_candidates()` | VIEW_PERFORMANCE (141) | Rel Volume | Descending |
+   | Purple `screen()` direct call | VIEW_OVERVIEW (111) | Market Cap | Ascending |
+
+3. **New `sort_dataframe()` public utility**: Parses numeric columns (strips %, B, M, K suffixes via `_clean_numeric()`), sorts in-place, pushes NaN to bottom.
+
+4. **`max_pages` increased 5→10**: 200 results per query (was 100). First fetch takes ~15s (1.5s polite delay per page) but results are cached for 1 hour.
+
+5. **Cache key includes view**: `"{filters}|{order_by}|v{view}|p{max_pages}"` ensures different views produce separate cache entries.
+
+#### Verification
+
+- Red team: Top candidates now XWEL (57.58% short float), ZENA (56.42%), TNGX (49.87%) instead of alphabetical A-C tickers.
+- Green team: Top candidates sorted by Rel Volume — ARTL (1722×), AIM (128×), QSEA (25×).
+- Blue team: Top candidates sorted by Rel Volume — AIM (128×), OVID (24×), MDAI (20×).
+- Full Red team pipeline run confirms different, properly-ranked results.
+
+#### Files Changed
+
+- `src/utils/finviz_scraper.py`: Added `VIEW_*` constants, `view` parameter to `screen()`, `sort_dataframe()` utility, client-side sorting in all 3 convenience functions.
+- `src/teams/purple/screener.py`: Passes `view=VIEW_OVERVIEW` and calls `sort_dataframe()` for smallest-market-cap-first ordering.
+
+---
+
 ## [1.0.1] - 2026-03-18
 
 ### Elite Team Audit — 12 Issues Fixed (3 P0, 3 P1, 6 P2)
