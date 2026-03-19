@@ -28,6 +28,7 @@ import requests
 from src.core.base import BaseScreener
 from src.core.cache import cache_json, load_cached_json
 from src.core.data_types import ScreenResult, SentimentSnapshot
+from src.utils import market_data
 
 logger = logging.getLogger(__name__)
 
@@ -649,6 +650,18 @@ class SocialSentimentScreener(BaseScreener):
         if snap.mention_count == 0 and snap.google_trends_score is None:
             return None
 
+        # Market cap gate: social sentiment is most actionable for small caps
+        # that can actually achieve explosive moves
+        info = market_data.get_ticker_info(snap.ticker)
+        mcap = info.get("marketCap") if info else None
+        max_mcap = self._team_cfg().get("max_market_cap_millions", 3000)
+        if mcap is not None and mcap > max_mcap * 1e6:
+            logger.debug(
+                "[yellow] %s market cap $%.1fB exceeds max $%.1fB, skipping.",
+                ticker, mcap / 1e9, max_mcap / 1e3,
+            )
+            return None
+
         s1 = self._score_mention_frequency(snap)
         s2 = self._score_sentiment_polarity(snap)
         s3 = self._score_momentum(snap)
@@ -672,6 +685,7 @@ class SocialSentimentScreener(BaseScreener):
             },
             metadata={
                 "trending_rank": snap.trending_rank,
+                "market_cap_millions": mcap / 1e6 if mcap else None,
                 "sources": snap.sources,
             },
         )

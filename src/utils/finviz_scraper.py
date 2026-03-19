@@ -250,3 +250,43 @@ def get_low_float_candidates(
         price_map.get(min_price, "sh_price_o1"),
     ]
     return screen(codes)
+
+
+def get_small_cap_momentum_candidates(
+    max_cap: str = "smallunder2b",
+    min_rvol: str = "over1.5",
+    min_price: str = "over1",
+    min_avg_volume: str = "over200k",
+) -> pd.DataFrame:
+    """Convenience: fetch small-cap stocks with momentum signals for Blue Team.
+
+    Targets stocks under $2B market cap with elevated relative volume,
+    indicating potential momentum setups.
+    """
+    cap_map = {
+        "micro": "cap_micro",
+        "smallunder2b": "cap_smallunder",
+        "small": "cap_small",
+    }
+    rvol_map = {
+        "over1.5": "sh_relvol_o1.5",
+        "over2": "sh_relvol_o2",
+        "over3": "sh_relvol_o3",
+    }
+    vol_map = {
+        "over100k": "sh_avgvol_o100",
+        "over200k": "sh_avgvol_o200",
+        "over500k": "sh_avgvol_o500",
+    }
+    price_map = {
+        "over1": "sh_price_o1",
+        "over5": "sh_price_o5",
+    }
+
+    codes = [
+        cap_map.get(max_cap, "cap_smallunder"),
+        rvol_map.get(min_rvol, "sh_relvol_o1.5"),
+        vol_map.get(min_avg_volume, "sh_avgvol_o200"),
+        price_map.get(min_price, "sh_price_o1"),
+    ]
+    return screen(codes)

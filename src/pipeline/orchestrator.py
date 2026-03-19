@@ -1,8 +1,9 @@
 """
-Pipeline Orchestrator: coordinates all five team screeners.
+Pipeline Orchestrator: coordinates all six team screeners.
 
 Runs each team's screening pipeline, merges results into a unified
-watchlist with composite scoring, and outputs to CSV / console.
+watchlist with composite scoring, resonance detection, and outputs
+to CSV / console.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ _SCREENER_REGISTRY: dict[str, str] = {
     "yellow": "src.teams.yellow.screener.SocialSentimentScreener",
     "green": "src.teams.green.screener.LowFloatBreakoutScreener",
     "blue": "src.teams.blue.screener.MomentumCatalystScreener",
+    "purple": "src.teams.purple.screener.TenBaggerScreener",
 }
 
 
@@ -46,11 +48,12 @@ def _create_screener(qualified_name: str) -> BaseScreener:
 # Fallback team weights used when config/default.yaml does not define
 # orchestrator.team_weights (or a caller does not supply explicit overrides).
 _FALLBACK_TEAM_WEIGHTS: dict[str, float] = {
-    "red": 1.0,
-    "orange": 1.0,
-    "yellow": 0.8,     # Sentiment is noisier, slightly lower weight
-    "green": 1.0,
-    "blue": 0.9,
+    "red": 1.2,        # Short squeeze — core 10x driver
+    "orange": 1.0,     # Gamma squeeze — important catalyst amplifier
+    "yellow": 0.7,     # Sentiment — noisier context signal
+    "green": 1.2,      # Low float breakout — core 10x driver
+    "blue": 0.5,       # Momentum — redesigned for small caps
+    "purple": 1.3,     # 10x structural potential — highest weight
 }
 
 # Display metadata for each team: Chinese name, icon, weight label, and sub-factor mapping
@@ -110,14 +113,29 @@ TEAM_DISPLAY = {
             ("市场环境", "market_regime"),
         ],
     },
+    "purple": {
+        "name": "十倍潜力评估师",
+        "icon": "🟣",
+        "weight_label": "紫",
+        "factors": [
+            ("市值层级", "market_cap_tier"),
+            ("流通结构", "float_structure"),
+            ("稀释风险", "dilution_risk"),
+            ("爆发蓄势", "explosive_setup"),
+        ],
+    },
 }
 
 # Canonical team order for display
-TEAM_ORDER = ["red", "orange", "yellow", "green", "blue"]
+TEAM_ORDER = ["red", "orange", "yellow", "green", "blue", "purple"]
 
 
 class PipelineOrchestrator:
-    """Master orchestrator for the five-team screening pipeline.
+    """Master orchestrator for the six-team screening pipeline.
+
+    Coordinates all teams, merges results with weighted composite scoring,
+    applies resonance bonuses for multi-team convergence, and outputs
+    a unified watchlist optimized for 10x potential identification.
 
     Usage::
 
@@ -407,7 +425,12 @@ class PipelineOrchestrator:
         return team_dfs
 
     def _merge_and_score(self, team_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Merge team DataFrames and compute composite score."""
+        """Merge team DataFrames, compute composite score, and apply resonance bonus.
+
+        The resonance bonus rewards tickers that are flagged by multiple teams
+        simultaneously — a strong convergence signal that dramatically increases
+        the probability of explosive moves.
+        """
         if not team_dfs:
             return pd.DataFrame()
 
@@ -457,6 +480,46 @@ class PipelineOrchestrator:
                 merged["team_count"] = sum(
                     (merged[col] > 0).astype(int) for col in score_cols
                 )
+
+                # ── Resonance bonus ──
+                # When N+ teams all flag the same ticker (score > 0),
+                # it indicates multi-signal convergence — the hallmark of
+                # a true 10x setup.  Apply a multiplicative boost.
+                res_min = self.cfg.get_nested(
+                    "orchestrator", "resonance_min_teams", default=3,
+                )
+                res_mult = self.cfg.get_nested(
+                    "orchestrator", "resonance_multiplier", default=1.25,
+                )
+                resonance_mask = merged["team_count"] >= res_min
+                if resonance_mask.any():
+                    merged.loc[resonance_mask, "composite_score"] *= res_mult
+                    merged["resonance"] = resonance_mask.astype(int)
+                    logger.info(
+                        "Resonance bonus (×%.2f) applied to %d tickers with %d+ team hits.",
+                        res_mult, resonance_mask.sum(), res_min,
+                    )
+                else:
+                    merged["resonance"] = 0
+
+                # ── Global market cap gate ──
+                # Post-merge safety net: remove tickers exceeding the global
+                # market cap ceiling even if individual teams allowed them.
+                global_max_mcap = self.cfg.get_nested(
+                    "orchestrator", "global_max_market_cap_millions", default=5000,
+                )
+                mcap_cols = [c for c in merged.columns if "market_cap_millions" in c]
+                if mcap_cols:
+                    # Coalesce across teams: take first non-null value per row
+                    mcap_series = merged[mcap_cols].bfill(axis=1).iloc[:, 0]
+                    keep_mask = mcap_series.isna() | (mcap_series <= global_max_mcap)
+                    removed = (~keep_mask).sum()
+                    if removed > 0:
+                        logger.info(
+                            "Global market cap gate ($%dM): removed %d tickers.",
+                            global_max_mcap, removed,
+                        )
+                        merged = merged[keep_mask].copy()
 
                 # Sort by composite score descending
                 merged.sort_values("composite_score", ascending=False, inplace=True)
@@ -526,11 +589,14 @@ class PipelineOrchestrator:
             composite = self._safe_float(row.get("composite_score", 0))
             team_count = int(self._safe_float(row.get("team_count", 0)))
 
+            resonance = int(self._safe_float(row.get("resonance", 0)))
+            res_tag = " 🔥共振" if resonance else ""
+
             lines.append("")
             lines.append(
                 f"\u2501\u2501\u2501 #{rank_num} {ticker} | "
                 f"综合评分: {composite:.1f}/100 | "
-                f"命中团队: {team_count}/{total_teams} \u2501\u2501\u2501"
+                f"命中团队: {team_count}/{total_teams}{res_tag} \u2501\u2501\u2501"
             )
 
             # Per-team detail -- only show active teams

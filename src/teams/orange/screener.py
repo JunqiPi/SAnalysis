@@ -42,17 +42,27 @@ class GammaSqueezeScreener(BaseScreener):
     # ------------------------------------------------------------------
 
     def fetch_candidates(self) -> list[str]:
-        """Return tickers with active options markets.
+        """Return optionable tickers with active options markets.
 
-        Phase 1: uses a curated list of liquid optionable tickers.
-        Phase 2+: will scan option volume screeners.
+        Focused on small-to-mid cap stocks with 10x potential.
+        Mega-caps (AAPL, MSFT, NVDA, GOOG, META, AMZN) are excluded —
+        their options markets are active but they cannot 10x.
+
+        Note: Orange team allows up to $5B market cap (higher than other teams)
+        because gamma squeeze mechanics work on mid-caps too, and mid-caps
+        are more likely to have liquid options chains.
         """
-        # Curated list of meme/squeeze-adjacent optionable tickers
         return [
-            "GME", "AMC", "TSLA", "NVDA", "AAPL", "PLTR", "SOFI",
-            "NIO", "RIVN", "LCID", "CLOV", "FUBO", "MARA",
-            "RIOT", "COIN", "HOOD", "SNAP", "PINS", "RBLX",
-            "DKNG", "SPCE", "UPST", "SMCI", "ARM",
+            # Meme/squeeze core (high option activity + squeeze potential)
+            "GME", "AMC", "PLTR", "SOFI", "CLOV", "FUBO",
+            # EV plays with active options
+            "NIO", "RIVN", "LCID", "GOEV",
+            # Crypto-adjacent with options
+            "MARA", "RIOT", "COIN", "HOOD",
+            # High-beta small/mid caps with liquid options
+            "SNAP", "PINS", "RBLX", "DKNG", "UPST",
+            # Recent high-activity names
+            "SPCE", "SMCI", "ARM",
         ]
 
     # ------------------------------------------------------------------
@@ -535,6 +545,18 @@ class GammaSqueezeScreener(BaseScreener):
         if spot is None or spot <= 0:
             return None
 
+        # Market cap gate: gamma squeezes can work on mid-caps, but mega-caps are excluded
+        cfg = self._team_cfg()
+        max_mcap = cfg.get("max_market_cap_millions", 5000)  # Orange allows up to $5B
+        info = market_data.get_ticker_info(ticker)
+        mcap = info.get("marketCap") if info else None
+        if mcap is not None and mcap > max_mcap * 1e6:
+            logger.debug(
+                "[orange] %s market cap $%.1fB exceeds max $%.1fB, skipping.",
+                ticker, mcap / 1e9, max_mcap / 1e3,
+            )
+            return None
+
         gex = self._estimate_gex(snap, spot)
         unusual = self._detect_unusual_activity(snap, spot)
         iv_data = self._analyze_iv(snap, spot)
@@ -564,6 +586,7 @@ class GammaSqueezeScreener(BaseScreener):
             metadata={
                 "expiration": snap.expiration,
                 "spot_price": spot,
+                "market_cap_millions": mcap / 1e6 if mcap else None,
                 "max_gamma_strike": gex.get("max_gamma_strike"),
                 "gex_flip_strike": gex.get("gex_flip_strike"),
                 "unusual_strikes": unusual.get("unusual_strikes", []),

@@ -1,13 +1,13 @@
 # SAnalysis — Meme Stock Analysis Platform
 
-> v0.5.0 (2026-03-17) · Claude AI Re-Scoring Integration
+> v1.0.0 (2026-03-18) · 10x Monster Stock Focus Overhaul
 > Python 3.12 · venv at `.venv/` · Ubuntu 24.04 / WSL2
 
 ## Quick Start
 
 ```bash
 source /root/Pi/SAnalysis/.venv/bin/activate
-python main.py                          # Run all 5 teams
+python main.py                          # Run all 6 teams
 python main.py --teams red green        # Run specific teams
 python main.py --tickers GME AMC TSLA   # Analyze specific tickers
 python main.py --no-parallel            # Sequential mode (debug)
@@ -40,9 +40,10 @@ src/
 │   ├── orange/screener.py
 │   ├── yellow/screener.py
 │   ├── green/screener.py
-│   └── blue/screener.py
+│   ├── blue/screener.py
+│   └── purple/screener.py  # ← NEW in v1.0.0: 10x potential structural assessor
 ├── pipeline/
-│   └── orchestrator.py  # ThreadPoolExecutor, merge, weighted composite score, AI re-scoring
+│   └── orchestrator.py  # ThreadPoolExecutor, merge, weighted composite, resonance detection, AI re-scoring
 └── main.py              # CLI entry point
 ```
 
@@ -55,13 +56,16 @@ src/
 | 🟡 Yellow | `SocialSentimentScreener` | `src/teams/yellow/screener.py` | `yellow_team` | `social-sentiment-quant` | mention_frequency, sentiment_polarity, sentiment_momentum, signal_quality |
 | 🟢 Green | `LowFloatBreakoutScreener` | `src/teams/green/screener.py` | `green_team` | `low-float-breakout` | float_tightness, volume_explosion, technical_setup, breakout_quality |
 | 🔵 Blue | `MomentumCatalystScreener` | `src/teams/blue/screener.py` | `blue_team` | `momentum-catalyst-fusion` | price_momentum, catalyst_proximity, financial_quality, market_regime |
+| 🟣 Purple | `TenBaggerScreener` | `src/teams/purple/screener.py` | `purple_team` | N/A (structural only) | market_cap_tier, float_structure, dilution_risk, explosive_setup |
 | 🟧 SDE-Team | N/A (code writer) | N/A | N/A | `SDE-Team` | N/A |
 
 ## Scoring Model
 
 - Each team: 4 factors × 25 points = **100 max per team**
 - All teams output `ScreenResult` dataclass (defined in `src/core/data_types.py`)
-- Orchestrator computes weighted composite: `red×1.0, orange×1.0, yellow×0.8, green×1.0, blue×0.9`
+- Orchestrator computes weighted composite: `red×1.2, orange×1.0, yellow×0.7, green×1.2, blue×0.5, purple×1.3`
+- **Market cap gates**: All teams filter out stocks above team-specific market cap ceilings (Red/Green/Blue/Purple: $2B, Yellow: $3B, Orange: $5B)
+- **Resonance bonus**: When 3+ teams flag the same ticker (score > 0), a ×1.25 multiplier is applied to the composite score
 - **AI Re-Scoring** (opt-in via `--ai-rescore`): `blended = quant×0.7 + ai×0.3` (configurable `ai_weight`)
 - Results sorted by composite score, saved to `data/output/watchlist_YYYYMMDD_HHMMSS.csv`
 
@@ -91,7 +95,7 @@ Optional: praw (Reddit API — needs keys in secrets.yaml), anthropic (AI re-sco
 
 ## Agent Instructions
 
-**Analysis Agents (5 teams)**: When asked to analyze stocks, you MUST:
+**Analysis Agents (6 teams)**: When asked to analyze stocks, you MUST:
 1. First run the Python pipeline: `python main.py --teams <your_color>`
 2. Read the output CSV from `data/output/`
 3. Use the Python scoring as your quantitative foundation
@@ -133,3 +137,13 @@ Optional: praw (Reddit API — needs keys in secrets.yaml), anthropic (AI re-sco
   - **Display**: AI scores shown in `print_summary()` with confidence level, reasoning excerpt, and flags.
   - **Dependencies**: `anthropic>=0.39.0` added as optional `[ai]` extra in `pyproject.toml`.
   - **Review fixes**: (1) `is_available()` duplicate warning suppression via `_availability_warned` flag, (2) `_call_api` RateLimitError now logs ERROR on final attempt before returning None, (3) score blending vectorized with `df.loc[]` replacing O(n) `iloc` loop, (4) `ai_rescore.enabled` config now actually read by orchestrator (CLI OR YAML), (5) removed dead `AIRescoreResult` import from orchestrator + fixed YAML comment header duplication.
+- **2026-03-18 v1.0.0**: **10x Monster Stock Focus Overhaul** — Major architectural redesign to align the entire platform with its core mission: finding stocks that can 10x+.
+  - **NEW: Purple Team** (`src/teams/purple/screener.py`): `TenBaggerScreener` evaluates structural 10x potential via 4 factors — `market_cap_tier` (piecewise breakpoints, nano=25 to large=0), `float_structure` (float size + insider ownership + low institutional), `dilution_risk` (inverted: cash/debt + OCF + share lockup), `explosive_setup` (BB squeeze + 52w position + OBV divergence + 5d return). Highest weight (1.3) in composite scoring.
+  - **Global market cap gates**: Every team now filters out stocks exceeding configurable market cap ceilings — Red/Green/Blue/Purple: $2B, Yellow: $3B, Orange: $5B. Unknown market cap (`None`) passes through conservatively.
+  - **Blue Team overhaul**: Replaced hardcoded large-cap list (AAPL, MSFT, GOOG, NVDA, META, AMZN removed) with dynamic Finviz small-cap momentum scan. New `get_small_cap_momentum_candidates()` in `finviz_scraper.py`. Analyst coverage bonus reduced (7→5pts), new 2pt "hidden gem" bonus for uncovered stocks. `min_momentum_score` lowered 60→40.
+  - **Orange Team cleanup**: Removed TSLA/NVDA/AAPL from candidates. Market cap gate at $5B (gamma squeezes work on mid-caps).
+  - **Red Team tightened**: `max_market_cap_millions` 10000→2000 in config.
+  - **Orchestrator v2**: Resonance detection — when 3+ teams flag the same ticker, ×1.25 composite score multiplier. `🔥共振` tag in `print_summary()`. Rebalanced weights: `red×1.2, orange×1.0, yellow×0.7, green×1.2, blue×0.5, purple×1.3`.
+  - **Config**: New `purple_team` section, `orchestrator.resonance_min_teams`, `orchestrator.resonance_multiplier`, `orchestrator.global_max_market_cap_millions`. Market cap thresholds added to orange/yellow/green/blue team configs. Green `max_price` 50→30.
+  - **Global gate wired**: `orchestrator.global_max_market_cap_millions` ($5B) now enforced in `_merge_and_score()` as post-merge safety net — coalesces `meta_market_cap_millions` columns across teams, filters exceeding tickers.
+  - **Files changed**: 10 files (2 new, 8 modified). `src/teams/purple/__init__.py`, `src/teams/purple/screener.py`, `src/pipeline/orchestrator.py`, `src/teams/blue/screener.py`, `src/teams/orange/screener.py`, `src/teams/green/screener.py`, `src/teams/yellow/screener.py`, `src/utils/finviz_scraper.py`, `config/default.yaml`, `CLAUDE.md`.

@@ -24,7 +24,7 @@ import pandas as pd
 
 from src.core.base import BaseScreener
 from src.core.data_types import MomentumSnapshot, ScreenResult
-from src.utils import market_data, technical
+from src.utils import finviz_scraper, market_data, technical
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +44,50 @@ class MomentumCatalystScreener(BaseScreener):
     # ------------------------------------------------------------------
 
     def fetch_candidates(self) -> list[str]:
-        """Return tickers to analyze for momentum + catalyst setups.
+        """Fetch small-cap momentum candidates from Finviz.
 
-        Phase 1: curated list of stocks known for momentum plays.
-        Phase 2+: will use screener APIs for momentum scans.
+        Phase 2 upgrade: replaced hardcoded large-cap list with dynamic
+        Finviz screening for small caps (<$2B) with elevated RVOL.
+        Large-cap stocks (AAPL, MSFT, etc.) are excluded by design --
+        they cannot achieve the 10x returns this platform targets.
+        """
+        try:
+            df = finviz_scraper.get_small_cap_momentum_candidates(
+                max_cap="smallunder2b",
+                min_rvol="over1.5",
+                min_price="over1",
+                min_avg_volume="over200k",
+            )
+            if not df.empty:
+                ticker_col = "Ticker" if "Ticker" in df.columns else df.columns[1]
+                tickers = df[ticker_col].tolist()
+                logger.info("[blue] Finviz returned %d small-cap momentum candidates.", len(tickers))
+                return tickers
+            else:
+                logger.warning("[blue] Finviz returned empty, falling back to curated list.")
+        except Exception:
+            logger.exception("[blue] Finviz small-cap scan failed, falling back to curated list.")
+
+        return self._fallback_tickers()
+
+    def _fallback_tickers(self) -> list[str]:
+        """Curated list of small/micro-cap momentum stocks.
+
+        All tickers must be under $10B market cap. Large caps
+        (AAPL, MSFT, GOOG, NVDA, META, AMZN) are explicitly excluded
+        as they cannot achieve 10x returns in a reasonable timeframe.
         """
         return [
-            # High-beta momentum names
-            "TSLA", "NVDA", "AMD", "META", "AMZN", "AAPL", "MSFT", "GOOG",
-            # Meme/squeeze adjacent
-            "GME", "AMC", "PLTR", "SOFI", "RIVN", "LCID", "NIO",
-            # Biotech/catalyst-driven
-            "MRNA", "BNTX", "CRSP",
-            # Recent IPO/SPAC momentum
-            "HOOD", "COIN", "RBLX", "DKNG", "UPST",
-            # Small-cap momentum
-            "FUBO", "CLOV", "MARA", "RIOT",
+            # Meme/squeeze-adjacent small caps
+            "GME", "AMC", "PLTR", "SOFI", "CLOV", "FUBO",
+            # EV small caps
+            "GOEV", "RIVN", "LCID", "NIO",
+            # Crypto-adjacent
+            "MARA", "RIOT", "COIN", "HOOD",
+            # High-beta small caps
+            "UPST", "DKNG", "RBLX",
+            # Biotech catalyst plays
+            "CRSP",
         ]
 
     # ------------------------------------------------------------------
@@ -289,9 +317,12 @@ class MomentumCatalystScreener(BaseScreener):
             elif de < max_de:
                 score += 2.0
 
-        # Analyst coverage (0-7 additional)
+        # Analyst coverage (0-5 additional, reduced from 7 -- many 10x candidates lack coverage)
         if snap.eps_estimate is not None:
-            score += 7.0
+            score += 5.0
+        else:
+            # Under-the-radar bonus: unanalyzed stocks have more 10x potential
+            score += 2.0
 
         return min(25.0, score)
 
@@ -349,8 +380,19 @@ class MomentumCatalystScreener(BaseScreener):
         if snap is None:
             return None
 
-        # Momentum gate: skip tickers below minimum momentum threshold
+        # Market cap gate: exclude stocks too large for 10x potential
         cfg = self._team_cfg()
+        info = market_data.get_ticker_info(ticker)
+        mcap = info.get("marketCap") if info else None
+        max_mcap = cfg.get("max_market_cap_millions", 2000)
+        if mcap is not None and mcap > max_mcap * 1e6:
+            logger.debug(
+                "[blue] %s market cap $%.1fB exceeds max $%.1fB, skipping.",
+                ticker, mcap / 1e9, max_mcap / 1e3,
+            )
+            return None
+
+        # Momentum gate: skip tickers below minimum momentum threshold
         min_mom = cfg.get("min_momentum_score", 0)
         if min_mom > 0 and snap.momentum_score < min_mom:
             logger.debug(
@@ -401,5 +443,6 @@ class MomentumCatalystScreener(BaseScreener):
                 "debt_to_equity": snap.debt_to_equity,
                 "market_regime": snap.market_regime,
                 "regime_multiplier": regime_multiplier,
+                "market_cap_millions": mcap / 1e6 if mcap else None,
             },
         )

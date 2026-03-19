@@ -1,5 +1,78 @@
 # SAnalysis - Change Log
 
+## [1.0.0] - 2026-03-18
+
+### 10x Monster Stock Focus Overhaul
+
+**Implemented by**: SDE-Team (2 new files, 8 modified files)
+
+**Motivation**: The platform's core mission is finding stocks that can achieve 10x+ returns. However, large-cap stocks (AAPL $3.5T, MSFT $3.2T, GOOG, NVDA, META, AMZN) were polluting candidates across multiple teams. These mega-caps cannot 10x in any reasonable timeframe. This release implements a comprehensive architectural redesign: a new Purple Team for structural 10x potential assessment, global market cap gates across all teams, dynamic small-cap candidate sourcing, orchestrator resonance detection, and rebalanced composite weights.
+
+#### New Team: Purple — 10x Potential Assessor (`src/teams/purple/`)
+
+- **`src/teams/purple/__init__.py`**: Package init exposing `TenBaggerScreener`.
+- **`src/teams/purple/screener.py`**: `TenBaggerScreener(BaseScreener)` — evaluates structural characteristics for 10x+ return potential.
+- **Candidate discovery**: Primary source is Finviz `screen()` with `cap_smallunder` + `sh_avgvol_o200` + `sh_price_o1`. Fallback: 21-ticker curated list of historically volatile micro/small-cap stocks (FFIE, MULN, SOFI, MARA, RIOT, etc.).
+- **Scoring model (4 × 25 = 100)**:
+  - `market_cap_tier` (0-25): Piecewise breakpoints from nano cap ($<50M, 25pts) to large cap ($≥5B, 0pts). Hard gate at configurable `max_market_cap_millions` (default $2B).
+  - `float_structure` (0-25): Float size (0-10, smaller=better), insider ownership (0-8, higher=better alignment), institutional ownership (0-7, lower=better for squeeze potential).
+  - `dilution_risk` (0-25, inverted): Cash/debt ratio (0-10), OCF/FCF sustainability (0-8, positive OCF=self-funding=no dilution pressure), share structure float/outstanding ratio (0-7).
+  - `explosive_setup` (0-25): BB width compression vs 20-day average (0-8), 52-week range position (0-6, sweet spot 10-30% from low), OBV divergence/accumulation (0-6), 5-day return momentum (0-5).
+- **Design**: Defensive config access (`self.cfg.data.get("purple_team", {})`), sub-score decomposition into 4 `@staticmethod` methods, OCF-based cash runway heuristic.
+
+#### Global Market Cap Gates (All 6 Teams)
+
+Every team now filters stocks exceeding configurable market cap ceilings in their `analyze()` method:
+
+| Team | Threshold | Rationale |
+|------|-----------|-----------|
+| Red | $2B (was $10B) | Short squeezes most explosive in small caps |
+| Orange | $5B (new) | Gamma squeezes work on mid-caps with liquid options |
+| Yellow | $3B (new) | Social sentiment actionable for small/mid caps |
+| Green | $2B (new) | Low-float breakouts require small caps |
+| Blue | $2B (new) | Momentum-driven 10x potential only in small caps |
+| Purple | $2B (new) | Structural 10x potential requires small market cap |
+
+- **Orchestrator global gate**: Post-merge `global_max_market_cap_millions` ($5B) filters any tickers that slipped through individual team gates. Coalesces `meta_market_cap_millions` across all teams.
+- All gates use pattern: `if mcap is not None and mcap > max_mcap * 1e6`. Unknown market cap (`None`) passes through conservatively.
+- All filtering uses `logger.debug` to avoid log noise from expected filtration.
+
+#### Blue Team 10x Overhaul (`src/teams/blue/screener.py`)
+
+- **Dynamic candidate sourcing**: Replaced hardcoded 27-ticker list (included 8 large-caps) with `finviz_scraper.get_small_cap_momentum_candidates()` querying Finviz for <$2B market cap stocks with RVOL >1.5x. Falls back to curated 18-ticker small/micro-cap list (`_fallback_tickers()`).
+- **New function**: `get_small_cap_momentum_candidates()` in `src/utils/finviz_scraper.py` — maps friendly names to Finviz filter codes, follows same pattern as existing convenience functions.
+- **Scoring adjustment**: Analyst coverage bonus reduced 7→5pts. New 2pt "hidden gem" bonus for uncovered stocks (under-the-radar = higher 10x potential). Max score: analyst=23/25, no analyst=20/25.
+- **Config**: `min_momentum_score` lowered 60→40 (small caps have choppier momentum signals).
+
+#### Orange Team Cleanup (`src/teams/orange/screener.py`)
+
+- **Candidates**: Removed TSLA, NVDA, AAPL. Added GOEV. List reorganized into thematic groups.
+- **Market cap gate**: $5B threshold after spot price check.
+
+#### Orchestrator v2 (`src/pipeline/orchestrator.py`)
+
+- **Purple Team integration**: Added to `_SCREENER_REGISTRY`, `TEAM_DISPLAY` (🟣十倍潜力评估师), and `TEAM_ORDER`.
+- **Resonance detection**: When `resonance_min_teams` (default 3) or more teams flag the same ticker with score > 0, a `resonance_multiplier` (default ×1.25) is applied to the composite score. `🔥共振` tag in `print_summary()`.
+- **Rebalanced weights**: `red×1.2, orange×1.0, yellow×0.7, green×1.2, blue×0.5, purple×1.3` — 10x-aligned teams (red, green, purple) upweighted, noisier signals (yellow, blue) downweighted.
+- **Global market cap gate**: Post-merge filter using `orchestrator.global_max_market_cap_millions` ($5B) as final safety net.
+
+#### Config Changes (`config/default.yaml`)
+
+- `red_team.max_market_cap_millions`: 10000 → 2000
+- `orange_team.max_market_cap_millions`: 5000 (new)
+- `yellow_team.max_market_cap_millions`: 3000 (new)
+- `green_team.max_price`: 50.0 → 30.0
+- `green_team.max_market_cap_millions`: 2000 (new)
+- `blue_team.min_momentum_score`: 60 → 40
+- `blue_team.max_market_cap_millions`: 2000 (new)
+- New `purple_team` section: `max_market_cap_millions`, `ideal_market_cap_millions`, `max_float_millions`, `min_insider_pct`
+- `orchestrator.team_weights`: rebalanced for 6 teams
+- `orchestrator.global_max_market_cap_millions`: 5000 (new)
+- `orchestrator.resonance_min_teams`: 3 (new)
+- `orchestrator.resonance_multiplier`: 1.25 (new)
+
+---
+
 ## [0.5.0] - 2026-03-17
 
 ### Claude AI Re-Scoring Integration + Post-Review Fixes

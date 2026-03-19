@@ -121,7 +121,7 @@ class LowFloatBreakoutScreener(BaseScreener):
         # Price filter
         cfg = self._team_cfg()
         min_price = cfg.get("min_price", 1.0)
-        max_price = cfg.get("max_price", 50.0)
+        max_price = cfg.get("max_price", 30.0)
         if latest_close < min_price or latest_close > max_price:
             return None
 
@@ -400,11 +400,22 @@ class LowFloatBreakoutScreener(BaseScreener):
         if hist.empty or len(hist) < 20:
             return None
 
+        # Market cap gate: low-float breakouts are most explosive in small caps
+        info = market_data.get_ticker_info(ticker)
+        mcap = info.get("marketCap") if info else None
+        cfg = self._team_cfg()
+        max_mcap = cfg.get("max_market_cap_millions", 2000)
+        if mcap is not None and mcap > max_mcap * 1e6:
+            logger.debug(
+                "[green] %s market cap $%.1fM exceeds max $%.1fM, skipping.",
+                ticker, mcap / 1e6, max_mcap,
+            )
+            return None
+
         snap = self._build_snapshot_from_hist(ticker, hist)
         if snap is None:
             return None
 
-        cfg = self._team_cfg()
         min_rvol = cfg.get("min_rvol", 2.0)
         if snap.rvol < min_rvol:
             return None
@@ -435,6 +446,7 @@ class LowFloatBreakoutScreener(BaseScreener):
             },
             metadata={
                 "float_shares": snap.float_shares,
+                "market_cap_millions": mcap / 1e6 if mcap else None,
                 "volume": snap.volume,
                 "ma_9": snap.ma_9,
                 "ma_20": snap.ma_20,

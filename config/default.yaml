@@ -31,7 +31,7 @@ red_team:
   min_short_float_pct: 10.0     # Minimum short float % to consider
   min_days_to_cover: 3.0        # Minimum DTC
   min_borrow_fee_pct: 5.0       # Elevated borrow fee threshold
-  max_market_cap_millions: 10000 # Focus on small/mid caps
+  max_market_cap_millions: 2000  # Focus on small caps (10x potential requires <$2B)
   min_relative_volume: 1.5      # Minimum RVOL for activity signal
 
   # Scoring weights (sum = 100)
@@ -56,6 +56,8 @@ orange_team:
   min_iv_percentile: 50           # Minimum IV rank to flag
   gex_calculation_enabled: true
   near_expiry_days: 30            # Focus on near-term expirations
+
+  max_market_cap_millions: 5000   # Gamma squeezes work on mid-caps; mega-caps excluded
 
   # GEX parameters
   spot_price_range_pct: 20        # +/- range around spot for GEX calc
@@ -89,6 +91,7 @@ yellow_team:
   sentiment_bullish_threshold: 0.3
   sentiment_bearish_threshold: -0.3
   mention_spike_multiplier: 3.0   # X times above average = spike
+  max_market_cap_millions: 3000   # Social sentiment most actionable for small caps
 
 # -----------------------------------------------------------
 # Green Team: Low Float Breakout Special Ops
@@ -97,7 +100,8 @@ green_team:
   # Float screening
   max_float_millions: 50          # Low float threshold
   min_price: 1.0                  # No sub-penny
-  max_price: 50.0                 # Focus range
+  max_price: 30.0                 # Focus range (tightened for 10x small-cap targets)
+  max_market_cap_millions: 2000   # Low-float breakouts most explosive in small caps
 
   # Volume thresholds
   min_rvol: 2.0                   # Relative volume multiplier
@@ -131,7 +135,7 @@ blue_team:
 
   # Momentum parameters
   momentum_periods: [5, 10, 21, 63, 126, 252]  # Trading days
-  min_momentum_score: 60          # Minimum composite momentum score
+  min_momentum_score: 40          # Lowered from 60: small caps have choppier momentum signals
 
   # Earnings / catalyst
   earnings_lookahead_days: 14     # Days before earnings to flag
@@ -142,9 +146,21 @@ blue_team:
   vix_low_threshold: 15           # VIX below this = low vol regime
   market_breadth_threshold: 0.5   # Advance/decline ratio threshold
 
+  # Market cap gate (10x potential filter)
+  max_market_cap_millions: 2000   # $2B cap -- large caps excluded by design
+
   # Financial quality filters
   min_revenue_growth_pct: 10.0    # YoY revenue growth
   max_debt_to_equity: 3.0         # Leverage cap
+
+# -----------------------------------------------------------
+# Purple Team: 10x Potential Assessor
+# -----------------------------------------------------------
+purple_team:
+  max_market_cap_millions: 2000   # Hard ceiling — stocks above this are disqualified
+  ideal_market_cap_millions: 500  # Sweet spot for 10x potential
+  max_float_millions: 50          # Prefer tight float
+  min_insider_pct: 0.05           # Minimum insider ownership (decimal, 5%)
 
 # -----------------------------------------------------------
 # AI Re-Scoring (opt-in via --ai-rescore CLI flag)
@@ -164,9 +180,20 @@ ai_rescore:
 # Orchestrator: Composite Scoring Weights
 # -----------------------------------------------------------
 orchestrator:
+  # Global market cap gate: applied post-merge to final results.
+  # Tickers exceeding this cap are removed even if individual teams
+  # have higher thresholds (e.g., Orange allows $5B).
+  global_max_market_cap_millions: 5000
+
+  # Resonance bonus: when N+ teams flag the same ticker with score > 0,
+  # a multiplicative bonus is applied to reward multi-signal convergence.
+  resonance_min_teams: 3          # Minimum teams for resonance bonus
+  resonance_multiplier: 1.25      # 25% boost when resonance triggers
+
   team_weights:
-    red: 1.0
-    orange: 1.0
-    yellow: 0.8       # Sentiment is noisier, slightly lower weight
-    green: 1.0
-    blue: 0.9
+    red: 1.2            # Short squeeze — core 10x driver (↑ from 1.0)
+    orange: 1.0         # Gamma squeeze — important catalyst amplifier
+    yellow: 0.7         # Sentiment — noisier, context signal (↓ from 0.8)
+    green: 1.2          # Low float breakout — core 10x driver (↑ from 1.0)
+    blue: 0.5           # Momentum — redesigned for small caps (↓ from 0.9)
+    purple: 1.3         # 10x structural potential — highest weight (NEW)
