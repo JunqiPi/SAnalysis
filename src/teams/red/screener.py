@@ -96,7 +96,10 @@ class ShortSqueezeScreener(BaseScreener):
         if not info:
             return None
 
-        short_pct = market_data.get_short_percent_of_float(ticker)
+        # Extract short % directly from info (avoids redundant get_ticker_info
+        # call inside get_short_percent_of_float).
+        raw_spf = info.get("shortPercentOfFloat")
+        short_pct = raw_spf * 100 if raw_spf is not None else None
         if short_pct is None:
             # Try computing from raw values
             shares_short = info.get("sharesShort")
@@ -408,6 +411,7 @@ class ShortSqueezeScreener(BaseScreener):
                 "float_shares": data.float_shares,
                 "short_shares": data.short_shares,
                 "avg_volume": data.avg_volume,
+                "market_cap_millions": mcap / 1e6 if mcap else None,
                 "source": data.source,
                 "si_as_of": data.as_of.isoformat() if data.as_of else None,
                 "si_age_days": si_age_days,

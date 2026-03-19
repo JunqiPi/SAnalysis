@@ -27,19 +27,29 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Module-level lazy cache for directory path and TTL to avoid
+# redundant mkdir syscalls and config lookups per cache operation.
+_CACHE_DIR: Path | None = None
+_TTL_SECONDS: float | None = None
+
 
 def _cache_dir() -> Path:
-    cfg = get_config()
-    rel = cfg.get_nested("general", "cache_dir", default="data/cache")
-    d = _PROJECT_ROOT / rel
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    global _CACHE_DIR
+    if _CACHE_DIR is None:
+        cfg = get_config()
+        rel = cfg.get_nested("general", "cache_dir", default="data/cache")
+        _CACHE_DIR = _PROJECT_ROOT / rel
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _CACHE_DIR
 
 
 def _ttl_seconds() -> float:
-    cfg = get_config()
-    hours = cfg.get_nested("general", "cache_ttl_hours", default=4)
-    return float(hours) * 3600
+    global _TTL_SECONDS
+    if _TTL_SECONDS is None:
+        cfg = get_config()
+        hours = cfg.get_nested("general", "cache_ttl_hours", default=4)
+        _TTL_SECONDS = float(hours) * 3600
+    return _TTL_SECONDS
 
 
 def _key_hash(namespace: str, key: str) -> str:
@@ -106,7 +116,7 @@ def load_cached_dataframe(namespace: str, key: str) -> pd.DataFrame | None:
         if age > _ttl_seconds():
             return None
         return pd.read_parquet(path)
-    except (json.JSONDecodeError, OSError, Exception) as exc:
+    except Exception as exc:
         logger.debug("Cache read failed for %s/%s: %s", namespace, key, exc)
         return None
 

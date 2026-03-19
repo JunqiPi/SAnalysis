@@ -40,7 +40,7 @@ def validate_ticker(ticker: str) -> str:
 
 
 class BaseScreener(ABC):
-    """Abstract base for all five team screeners.
+    """Abstract base for all six team screeners.
 
     Subclasses must implement:
         - team_name (property)

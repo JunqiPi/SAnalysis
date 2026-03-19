@@ -95,13 +95,17 @@ class LowFloatBreakoutScreener(BaseScreener):
         "Special Purpose Acquisition",
     })
 
-    def _build_snapshot_from_hist(self, ticker: str, hist: pd.DataFrame) -> Optional[TechnicalSnapshot]:
+    def _build_snapshot_from_hist(
+        self, ticker: str, hist: pd.DataFrame, info: dict | None = None,
+    ) -> Optional[TechnicalSnapshot]:
         """Build a comprehensive technical snapshot from pre-fetched history.
 
         Args:
             hist: 6mo daily OHLCV data (fetched once in analyze()).
+            info: Pre-fetched ticker info dict (avoids redundant cache read).
         """
-        info = market_data.get_ticker_info(ticker)
+        if info is None:
+            info = market_data.get_ticker_info(ticker)
 
         # Filter out SPACs / shell companies -- their NAV-anchored prices
         # produce false positives in breakout detection.
@@ -412,7 +416,7 @@ class LowFloatBreakoutScreener(BaseScreener):
             )
             return None
 
-        snap = self._build_snapshot_from_hist(ticker, hist)
+        snap = self._build_snapshot_from_hist(ticker, hist, info=info)
         if snap is None:
             return None
 

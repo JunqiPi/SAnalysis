@@ -243,7 +243,6 @@ def compute_support_resistance(
     lows = df["Low"]
 
     # Vectorized approach: rolling min/max over the window
-    half = window // 2
     roll_low_min = lows.rolling(window=window, center=True).min()
     roll_high_max = highs.rolling(window=window, center=True).max()
 

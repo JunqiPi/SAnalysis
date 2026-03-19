@@ -1,5 +1,41 @@
 # SAnalysis - Change Log
 
+## [1.0.1] - 2026-03-18
+
+### Elite Team Audit — 12 Issues Fixed (3 P0, 3 P1, 6 P2)
+
+**Implemented by**: SDE-Team (full codebase audit across 20+ files, 9 files modified)
+
+**Motivation**: Post-v1.0.0 comprehensive audit to verify time/space efficiency and logical correctness across all modules. The audit read every source file and cross-referenced data flows between teams, orchestrator, cache, and config layers.
+
+#### P0 — Blocking Bugs (3)
+
+1. **`main.py` — Purple team unreachable from CLI**: `argparse` `--teams` choices list was `["red", "orange", "yellow", "green", "blue"]` — missing `"purple"`. Running `python main.py --teams purple` would fail with `invalid choice: 'purple'`. Fixed by adding `"purple"` to choices.
+2. **`main.py` — Stale version string**: `__version__` was still `"0.5.0"` from two releases ago. Updated to `"1.0.0"`.
+3. **`main.py` — Stale CLI description**: Help text said "Five-Team" but there are now 6 teams. Updated to "Six-Team".
+
+#### P1 — Scoring/Data Integrity (3)
+
+4. **`src/teams/red/screener.py` — Missing `market_cap_millions` in metadata**: Red was the only team not emitting `market_cap_millions` in `ScreenResult.metadata`. The orchestrator's global market cap gate coalesces `meta_market_cap_millions` across teams — Red-only tickers had no market cap data for the gate to use. Fixed by adding `"market_cap_millions": mcap / 1e6 if mcap else None`.
+5. **`src/teams/yellow/screener.py` — Large-cap tickers in fallback list**: Fallback candidates included TSLA (~$1T) and NVDA (~$3T), which waste API calls since they're immediately filtered by the $3B market cap gate. Replaced with FUBO and MARA (small-cap, relevant to social sentiment).
+6. **`src/core/cache.py` — Redundant `mkdir` syscalls**: `_cache_dir()` called `Path.mkdir(exist_ok=True)` on every cache read/write (hundreds of times per scan). Refactored to module-level lazy caching with `_CACHE_DIR` and `_TTL_SECONDS` singletons — `mkdir` now called exactly once per process.
+
+#### P2 — Code Quality & Consistency (6)
+
+7. **`src/teams/red/screener.py` — Redundant `get_ticker_info` call eliminated**: `_collect_short_data` was calling `market_data.get_short_percent_of_float()` which internally calls `get_ticker_info()`. Since `_collect_short_data` already has the `info` dict, inlined the short float extraction directly from `info.get("shortPercentOfFloat")`.
+8. **`src/teams/purple/screener.py` — `market_cap_millions` in wrong dict**: Was in `signals` dict, moved to `metadata` dict for consistency with all other 5 teams. Also normalized key from `"market_cap"` (raw dollars) to `"market_cap_millions"` (millions, matching other teams).
+9. **`src/teams/green/screener.py` — Redundant `get_ticker_info` call in `_build_snapshot_from_hist`**: Added `info` parameter to `_build_snapshot_from_hist()` signature so `analyze()` can pass its pre-fetched info dict instead of triggering another cache read.
+10. **`src/utils/technical.py` — Dead variable**: Removed unused `half = window // 2` in `compute_support_resistance()`.
+11. **`src/core/base.py` — Stale docstring**: Changed "five team screeners" to "six team screeners".
+12. **`src/core/cache.py` — Redundant exception hierarchy**: `except (json.JSONDecodeError, OSError, Exception)` simplified to `except Exception` (the former two are already subclasses).
+
+#### Verification
+
+- 9/9 modified files pass Python AST compilation check
+- 11/11 programmatic verification assertions passed
+
+---
+
 ## [1.0.0] - 2026-03-18
 
 ### 10x Monster Stock Focus Overhaul

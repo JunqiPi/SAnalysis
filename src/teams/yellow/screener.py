@@ -238,7 +238,7 @@ class SocialSentimentScreener(BaseScreener):
 
         if not unique:
             # Fallback curated list
-            unique = ["GME", "AMC", "PLTR", "TSLA", "NVDA", "SOFI", "BB", "CLOV"]
+            unique = ["GME", "AMC", "PLTR", "SOFI", "BB", "CLOV", "FUBO", "MARA"]
 
         return unique
 

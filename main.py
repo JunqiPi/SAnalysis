@@ -36,7 +36,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"
 
 from src.pipeline.orchestrator import PipelineOrchestrator
 
@@ -56,7 +56,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SAnalysis - Meme Stock Five-Team Screening Platform",
+        description="SAnalysis - Meme Stock Six-Team Screening Platform",
     )
     parser.add_argument(
         "--version", "-V",
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teams",
         nargs="+",
-        choices=["red", "orange", "yellow", "green", "blue"],
+        choices=["red", "orange", "yellow", "green", "blue", "purple"],
         default=None,
         help="Which teams to run (default: all)",
     )
