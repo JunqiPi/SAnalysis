@@ -1,5 +1,7 @@
 # SAnalysis — Meme Stock Analysis Platform
 
+Rule 0: Ask me questions until you are 95% and up confident that you have understand my intention and goal
+
 > v1.0.0 (2026-03-18) · 10x Monster Stock Focus Overhaul
 > Python 3.12 · venv at `.venv/` · Ubuntu 24.04 / WSL2
 
